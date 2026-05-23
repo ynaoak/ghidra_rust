@@ -195,6 +195,8 @@ dependencies = [
  "gr-analysis",
  "gr-arch",
  "gr-core",
+ "gr-emulator",
+ "gr-lift",
  "gr-loader",
  "gr-program",
 ]
@@ -204,6 +206,26 @@ name = "gr-core"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "gr-emulator"
+version = "0.1.0"
+dependencies = [
+ "gr-core",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "gr-lift"
+version = "0.1.0"
+dependencies = [
+ "gr-core",
+ "gr-loader",
+ "iced-x86",
  "smallvec",
  "thiserror",
 ]

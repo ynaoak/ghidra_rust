@@ -1,0 +1,11 @@
+[package]
+name = "gr-emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P-code emulator for ghidra-rust"
+
+[dependencies]
+gr-core = { workspace = true }
+thiserror = { workspace = true }
+smallvec = { workspace = true }

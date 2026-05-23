@@ -1,0 +1,521 @@
+use gr_core::address::SpaceId;
+use gr_core::pcode::{OpCode, PcodeOp};
+
+use crate::state::EmulatorState;
+
+#[derive(Debug, thiserror::Error)]
+pub enum EmulatorError {
+    #[error("no output varnode for op {0}")]
+    MissingOutput(String),
+    #[error("missing input {index} for op {op}")]
+    MissingInput { op: String, index: usize },
+    #[error("halted at 0x{0:x}")]
+    Halted(u64),
+    #[error("branch to 0x{0:x}")]
+    Branch(u64),
+    #[error("return with value 0x{0:x}")]
+    Return(u64),
+    #[error("call to 0x{0:x}")]
+    Call(u64),
+    #[error("unsupported opcode: {0}")]
+    Unsupported(String),
+}
+
+pub struct Emulator {
+    pub state: EmulatorState,
+    pub step_count: u64,
+}
+
+impl Emulator {
+    pub fn new() -> Self {
+        Self {
+            state: EmulatorState::new(),
+            step_count: 0,
+        }
+    }
+
+    pub fn with_state(state: EmulatorState) -> Self {
+        Self {
+            state,
+            step_count: 0,
+        }
+    }
+
+    pub fn execute_op(&mut self, op: &PcodeOp) -> Result<(), EmulatorError> {
+        self.step_count += 1;
+
+        match op.opcode {
+            OpCode::Copy => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("COPY".into()))?;
+                let src = self.read_input(op, 0)?;
+                self.state.write_varnode(out, src);
+            }
+
+            OpCode::IntAdd => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_ADD".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, a.wrapping_add(b));
+            }
+
+            OpCode::IntSub => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SUB".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, a.wrapping_sub(b));
+            }
+
+            OpCode::IntMult => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_MULT".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, a.wrapping_mul(b));
+            }
+
+            OpCode::IntDiv => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_DIV".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                if b == 0 {
+                    return Err(EmulatorError::Halted(op.seq.addr.offset));
+                }
+                self.state.write_varnode(out, a / b);
+            }
+
+            OpCode::IntAnd => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_AND".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, a & b);
+            }
+
+            OpCode::IntOr => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_OR".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, a | b);
+            }
+
+            OpCode::IntXor => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_XOR".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, a ^ b);
+            }
+
+            OpCode::IntNegate => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_NEGATE".into()))?;
+                let a = self.read_input(op, 0)?;
+                self.state.write_varnode(out, !a);
+            }
+
+            OpCode::Int2Comp => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_2COMP".into()))?;
+                let a = self.read_input(op, 0)?;
+                self.state.write_varnode(out, (!a).wrapping_add(1));
+            }
+
+            OpCode::IntLeft => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_LEFT".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, a.wrapping_shl(b as u32));
+            }
+
+            OpCode::IntRight => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_RIGHT".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, a.wrapping_shr(b as u32));
+            }
+
+            OpCode::IntSRight => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SRIGHT".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, (a as i64).wrapping_shr(b as u32) as u64);
+            }
+
+            OpCode::IntEqual => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_EQUAL".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if a == b { 1 } else { 0 });
+            }
+
+            OpCode::IntNotEqual => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_NOTEQUAL".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if a != b { 1 } else { 0 });
+            }
+
+            OpCode::IntLess => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_LESS".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if a < b { 1 } else { 0 });
+            }
+
+            OpCode::IntSLess => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SLESS".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if (a as i64) < (b as i64) { 1 } else { 0 });
+            }
+
+            OpCode::IntZExt => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_ZEXT".into()))?;
+                let a = self.read_input(op, 0)?;
+                self.state.write_varnode(out, a);
+            }
+
+            OpCode::IntSExt => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SEXT".into()))?;
+                let in_vn = op.input(0).ok_or_else(|| EmulatorError::MissingInput { op: "INT_SEXT".into(), index: 0 })?;
+                let a = self.state.read_varnode(in_vn);
+                let sign_extended = match in_vn.size {
+                    1 => a as u8 as i8 as i64 as u64,
+                    2 => a as u16 as i16 as i64 as u64,
+                    4 => a as u32 as i32 as i64 as u64,
+                    _ => a,
+                };
+                self.state.write_varnode(out, sign_extended);
+            }
+
+            OpCode::Load => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("LOAD".into()))?;
+                let _space_id = self.read_input(op, 0)?;
+                let addr = self.read_input(op, 1)?;
+                let val = self.state.read_memory(addr, out.size);
+                self.state.write_varnode(out, val);
+            }
+
+            OpCode::Store => {
+                let space_id = self.read_input(op, 0)?;
+                let addr = self.read_input(op, 1)?;
+                let in_vn = op.input(2).ok_or_else(|| EmulatorError::MissingInput { op: "STORE".into(), index: 2 })?;
+                let val = self.state.read_varnode(in_vn);
+                if space_id == 1 {
+                    self.state.write_memory(addr, in_vn.size, val);
+                } else {
+                    self.state.write_varnode(
+                        &gr_core::pcode::VarnodeData::new(SpaceId(space_id as u32), addr, in_vn.size),
+                        val,
+                    );
+                }
+            }
+
+            OpCode::Branch => {
+                let target_vn = op.input(0).ok_or_else(|| EmulatorError::MissingInput { op: "BRANCH".into(), index: 0 })?;
+                return Err(EmulatorError::Branch(target_vn.offset));
+            }
+
+            OpCode::CBranch => {
+                let target_vn = op.input(0).ok_or_else(|| EmulatorError::MissingInput { op: "CBRANCH".into(), index: 0 })?;
+                let cond = self.read_input(op, 1)?;
+                if cond != 0 {
+                    return Err(EmulatorError::Branch(target_vn.offset));
+                }
+            }
+
+            OpCode::Call => {
+                let target_vn = op.input(0).ok_or_else(|| EmulatorError::MissingInput { op: "CALL".into(), index: 0 })?;
+                return Err(EmulatorError::Call(target_vn.offset));
+            }
+
+            OpCode::Return => {
+                let ret_val = self.read_input(op, 0)?;
+                return Err(EmulatorError::Return(ret_val));
+            }
+
+            OpCode::CallOther => {}
+
+            OpCode::Piece => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("PIECE".into()))?;
+                let hi_vn = op.input(0).ok_or_else(|| EmulatorError::MissingInput { op: "PIECE".into(), index: 0 })?;
+                let lo_vn = op.input(1).ok_or_else(|| EmulatorError::MissingInput { op: "PIECE".into(), index: 1 })?;
+                let hi = self.state.read_varnode(hi_vn);
+                let lo = self.state.read_varnode(lo_vn);
+                let result = (hi << (lo_vn.size * 8)) | lo;
+                self.state.write_varnode(out, result);
+            }
+
+            OpCode::Subpiece => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("SUBPIECE".into()))?;
+                let a = self.read_input(op, 0)?;
+                let truncate = self.read_input(op, 1)?;
+                self.state.write_varnode(out, a >> (truncate * 8));
+            }
+
+            OpCode::PopCount => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("POPCOUNT".into()))?;
+                let a = self.read_input(op, 0)?;
+                self.state.write_varnode(out, a.count_ones() as u64);
+            }
+
+            OpCode::LzCount => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("LZCOUNT".into()))?;
+                let a = self.read_input(op, 0)?;
+                self.state.write_varnode(out, a.leading_zeros() as u64);
+            }
+
+            OpCode::BoolNegate => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("BOOL_NEGATE".into()))?;
+                let a = self.read_input(op, 0)?;
+                self.state.write_varnode(out, if a == 0 { 1 } else { 0 });
+            }
+
+            OpCode::BoolAnd => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("BOOL_AND".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if a != 0 && b != 0 { 1 } else { 0 });
+            }
+
+            OpCode::BoolOr => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("BOOL_OR".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if a != 0 || b != 0 { 1 } else { 0 });
+            }
+
+            OpCode::BoolXor => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("BOOL_XOR".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if (a != 0) ^ (b != 0) { 1 } else { 0 });
+            }
+
+            _ => {
+                return Err(EmulatorError::Unsupported(op.opcode.name().into()));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn execute_ops(&mut self, ops: &[PcodeOp]) -> Result<(), EmulatorError> {
+        for op in ops {
+            self.execute_op(op)?;
+        }
+        Ok(())
+    }
+
+    fn read_input(&self, op: &PcodeOp, index: usize) -> Result<u64, EmulatorError> {
+        let vn = op.input(index).ok_or_else(|| EmulatorError::MissingInput {
+            op: op.opcode.name().into(),
+            index,
+        })?;
+        Ok(self.state.read_varnode(vn))
+    }
+}
+
+impl Default for Emulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gr_core::address::Address;
+    use gr_core::pcode::{SeqNum, VarnodeData};
+    use smallvec::SmallVec;
+
+    const REG: SpaceId = SpaceId(2);
+    const CNST: SpaceId = SpaceId(0);
+
+    fn seq() -> SeqNum {
+        SeqNum::new(Address::new(SpaceId(1), 0x1000), 0)
+    }
+
+    #[test]
+    fn emu_copy() {
+        let mut emu = Emulator::new();
+        let op = PcodeOp {
+            opcode: OpCode::Copy,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x00, 8)),
+            inputs: SmallVec::from_slice(&[VarnodeData::new(CNST, 42, 8)]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x00, 8), 42);
+    }
+
+    #[test]
+    fn emu_add_sub() {
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 8, 100);
+        emu.state.write_register(0x08, 8, 30);
+
+        let add = PcodeOp {
+            opcode: OpCode::IntAdd,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x00, 8)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 8),
+                VarnodeData::new(REG, 0x08, 8),
+            ]),
+        };
+        emu.execute_op(&add).unwrap();
+        assert_eq!(emu.state.read_register(0x00, 8), 130);
+
+        let sub = PcodeOp {
+            opcode: OpCode::IntSub,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x00, 8)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 8),
+                VarnodeData::new(CNST, 50, 8),
+            ]),
+        };
+        emu.execute_op(&sub).unwrap();
+        assert_eq!(emu.state.read_register(0x00, 8), 80);
+    }
+
+    #[test]
+    fn emu_load_store() {
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x20, 8, 0x8000);
+
+        // STORE [RSP] = 0xDEAD
+        let store = PcodeOp {
+            opcode: OpCode::Store,
+            seq: seq(),
+            output: None,
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(CNST, 1, 4),
+                VarnodeData::new(REG, 0x20, 8),
+                VarnodeData::new(CNST, 0xDEAD, 8),
+            ]),
+        };
+        emu.execute_op(&store).unwrap();
+        assert_eq!(emu.state.read_memory(0x8000, 8), 0xDEAD);
+
+        // RAX = LOAD [RSP]
+        let load = PcodeOp {
+            opcode: OpCode::Load,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x00, 8)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(CNST, 1, 4),
+                VarnodeData::new(REG, 0x20, 8),
+            ]),
+        };
+        emu.execute_op(&load).unwrap();
+        assert_eq!(emu.state.read_register(0x00, 8), 0xDEAD);
+    }
+
+    #[test]
+    fn emu_xor_self_zeros() {
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0x12345678);
+
+        let xor = PcodeOp {
+            opcode: OpCode::IntXor,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x00, 4)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x00, 4),
+            ]),
+        };
+        emu.execute_op(&xor).unwrap();
+        assert_eq!(emu.state.read_register(0x00, 4), 0);
+    }
+
+    #[test]
+    fn emu_comparison() {
+        let mut emu = Emulator::new();
+        let out = VarnodeData::new(SpaceId(3), 0, 1);
+
+        let eq = PcodeOp {
+            opcode: OpCode::IntEqual,
+            seq: seq(),
+            output: Some(out),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(CNST, 5, 8),
+                VarnodeData::new(CNST, 5, 8),
+            ]),
+        };
+        emu.execute_op(&eq).unwrap();
+        assert_eq!(emu.state.read_varnode(&out), 1);
+
+        let neq = PcodeOp {
+            opcode: OpCode::IntEqual,
+            seq: seq(),
+            output: Some(out),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(CNST, 5, 8),
+                VarnodeData::new(CNST, 6, 8),
+            ]),
+        };
+        emu.execute_op(&neq).unwrap();
+        assert_eq!(emu.state.read_varnode(&out), 0);
+    }
+
+    #[test]
+    fn emu_branch() {
+        let mut emu = Emulator::new();
+        let br = PcodeOp {
+            opcode: OpCode::Branch,
+            seq: seq(),
+            output: None,
+            inputs: SmallVec::from_slice(&[VarnodeData::new(SpaceId(1), 0x2000, 8)]),
+        };
+        match emu.execute_op(&br) {
+            Err(EmulatorError::Branch(0x2000)) => {}
+            other => panic!("expected Branch(0x2000), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn emu_cbranch_taken() {
+        let mut emu = Emulator::new();
+        let cbr = PcodeOp {
+            opcode: OpCode::CBranch,
+            seq: seq(),
+            output: None,
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(SpaceId(1), 0x3000, 8),
+                VarnodeData::new(CNST, 1, 1),
+            ]),
+        };
+        match emu.execute_op(&cbr) {
+            Err(EmulatorError::Branch(0x3000)) => {}
+            other => panic!("expected Branch(0x3000), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn emu_cbranch_not_taken() {
+        let mut emu = Emulator::new();
+        let cbr = PcodeOp {
+            opcode: OpCode::CBranch,
+            seq: seq(),
+            output: None,
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(SpaceId(1), 0x3000, 8),
+                VarnodeData::new(CNST, 0, 1),
+            ]),
+        };
+        emu.execute_op(&cbr).unwrap();
+    }
+
+    #[test]
+    fn emu_return() {
+        let mut emu = Emulator::new();
+        let ret = PcodeOp {
+            opcode: OpCode::Return,
+            seq: seq(),
+            output: None,
+            inputs: SmallVec::from_slice(&[VarnodeData::new(CNST, 0x9999, 8)]),
+        };
+        match emu.execute_op(&ret) {
+            Err(EmulatorError::Return(0x9999)) => {}
+            other => panic!("expected Return, got {:?}", other),
+        }
+    }
+}

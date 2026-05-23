@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use gr_analysis::{AnalysisManager, CallGraph};
 use gr_arch::arch::create_architecture;
+use gr_lift::x86::X86Lifter;
+use gr_lift::PcodeLift;
 use gr_loader::{BinaryLoader, SymbolKind};
 use gr_program::Program;
 
@@ -75,6 +77,17 @@ enum Commands {
         #[arg(long)]
         dot: bool,
     },
+    /// Show P-code for instructions at an address
+    Pcode {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Start address (hex). Defaults to entry point
+        #[arg(short, long, value_parser = parse_hex)]
+        start: Option<u64>,
+        /// Number of instructions to lift
+        #[arg(short = 'n', long, default_value = "16")]
+        count: usize,
+    },
     /// Hex dump at a given address
     Hexdump {
         /// Path to the binary file
@@ -117,6 +130,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Functions { file } => cmd_functions(&file),
         Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
         Commands::Callgraph { file, dot } => cmd_callgraph(&file, dot),
+        Commands::Pcode {
+            file,
+            start,
+            count,
+        } => cmd_pcode(&file, start, count),
         Commands::Hexdump {
             file,
             address,
@@ -444,5 +462,36 @@ fn cmd_callgraph(path: &Path, dot: bool) -> Result<(), Box<dyn std::error::Error
             }
         }
     }
+    Ok(())
+}
+
+fn cmd_pcode(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+
+    let is_64 = info.bits == 64;
+    let lifter: Box<dyn PcodeLift> = match info.arch {
+        gr_loader::Architecture::X86 | gr_loader::Architecture::X86_64 => {
+            if is_64 {
+                Box::new(X86Lifter::new_64())
+            } else {
+                Box::new(X86Lifter::new_32())
+            }
+        }
+        other => {
+            eprintln!("P-code lifting not yet supported for {}", other);
+            return Ok(());
+        }
+    };
+
+    let address = start.unwrap_or(info.entry_point);
+    println!("P-code listing at 0x{:x} ({}):\n", address, if is_64 { "x86_64" } else { "x86" });
+
+    let lifted = lifter.lift_range(&info.memory, address, count)?;
+    for insn in &lifted {
+        print!("{}", insn.display_pcode());
+    }
+
+    let total_ops: usize = lifted.iter().map(|l| l.ops.len()).sum();
+    println!("\n{} instructions -> {} P-code operations", lifted.len(), total_ops);
     Ok(())
 }

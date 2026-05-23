@@ -15,4 +15,6 @@ gr-loader = { workspace = true }
 gr-arch = { workspace = true }
 gr-program = { workspace = true }
 gr-analysis = { workspace = true }
+gr-lift = { workspace = true }
+gr-emulator = { workspace = true }
 clap = { workspace = true }
