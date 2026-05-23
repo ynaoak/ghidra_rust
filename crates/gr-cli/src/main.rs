@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use gr_analysis::{AnalysisManager, CallGraph};
 use gr_arch::arch::create_architecture;
+use gr_decompile::decompile;
 use gr_lift::x86::X86Lifter;
 use gr_lift::PcodeLift;
 use gr_loader::{BinaryLoader, SymbolKind};
@@ -88,6 +89,17 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "16")]
         count: usize,
     },
+    /// Decompile a function to C pseudocode
+    Decompile {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Function address (hex). Defaults to entry point
+        #[arg(short, long, value_parser = parse_hex)]
+        address: Option<u64>,
+        /// Show SSA dump instead of C output
+        #[arg(long)]
+        ssa: bool,
+    },
     /// Hex dump at a given address
     Hexdump {
         /// Path to the binary file
@@ -135,6 +147,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             start,
             count,
         } => cmd_pcode(&file, start, count),
+        Commands::Decompile { file, address, ssa } => cmd_decompile(&file, address, ssa),
         Commands::Hexdump {
             file,
             address,
@@ -493,5 +506,51 @@ fn cmd_pcode(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dy
 
     let total_ops: usize = lifted.iter().map(|l| l.ops.len()).sum();
     println!("\n{} instructions -> {} P-code operations", lifted.len(), total_ops);
+    Ok(())
+}
+
+fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+
+    let is_64 = info.bits == 64;
+    let lifter: Box<dyn PcodeLift> = match info.arch {
+        gr_loader::Architecture::X86 | gr_loader::Architecture::X86_64 => {
+            if is_64 {
+                Box::new(X86Lifter::new_64())
+            } else {
+                Box::new(X86Lifter::new_32())
+            }
+        }
+        other => {
+            eprintln!("Decompilation not yet supported for {}", other);
+            return Ok(());
+        }
+    };
+
+    let entry = address.unwrap_or(info.entry_point);
+    let func_name = info
+        .symbols
+        .iter()
+        .find(|s| s.address == entry)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| format!("FUN_{:x}", entry));
+
+    let result = decompile(lifter.as_ref(), &info.memory, entry, &func_name, 500)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    if show_ssa {
+        print!("{}", result.ssa_dump);
+    } else {
+        print!("{}", result.c_code);
+    }
+
+    eprintln!(
+        "\n// {} instructions, {} p-code ops, {} blocks, {} live ops after optimization ({})",
+        result.stats.instructions_lifted,
+        result.stats.pcode_ops,
+        result.stats.basic_blocks,
+        result.stats.live_ops_after,
+        result.stats.optimization,
+    );
     Ok(())
 }
