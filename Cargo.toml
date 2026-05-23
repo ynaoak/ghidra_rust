@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gr-core",
+    "crates/gr-loader",
+    "crates/gr-arch",
+    "crates/gr-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ynaoak222/ghidra-rust"
+
+[workspace.dependencies]
+gr-core = { path = "crates/gr-core" }
+gr-loader = { path = "crates/gr-loader" }
+gr-arch = { path = "crates/gr-arch" }
+goblin = "0.9"
+memmap2 = "0.9"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+smallvec = "1"
+bitflags = "2"
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "intel", "gas", "nasm", "instr_info"] }
+capstone = "0.13"

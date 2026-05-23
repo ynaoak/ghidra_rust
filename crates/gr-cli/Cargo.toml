@@ -1,0 +1,16 @@
+[package]
+name = "gr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI binary analysis tool powered by ghidra-rust"
+
+[[bin]]
+name = "ghidra-rust"
+path = "src/main.rs"
+
+[dependencies]
+gr-core = { workspace = true }
+gr-loader = { workspace = true }
+gr-arch = { workspace = true }
+clap = { workspace = true }

@@ -1,0 +1,531 @@
+use std::path::Path;
+use std::sync::Arc;
+
+use goblin::Object;
+use gr_core::address::Endian;
+
+use crate::error::LoaderError;
+use crate::memory::{Memory, MemoryBlock, MemoryFlags};
+use gr_core::address::SpaceId;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryFormat {
+    Elf,
+    Pe,
+    MachO,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Architecture {
+    X86,
+    X86_64,
+    Arm,
+    Arm64,
+    Mips,
+    Mips64,
+    Riscv32,
+    Riscv64,
+    PowerPc,
+    PowerPc64,
+    Sparc,
+    Unknown,
+}
+
+impl std::fmt::Display for Architecture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::X86 => write!(f, "x86"),
+            Self::X86_64 => write!(f, "x86_64"),
+            Self::Arm => write!(f, "ARM"),
+            Self::Arm64 => write!(f, "AArch64"),
+            Self::Mips => write!(f, "MIPS"),
+            Self::Mips64 => write!(f, "MIPS64"),
+            Self::Riscv32 => write!(f, "RISC-V 32"),
+            Self::Riscv64 => write!(f, "RISC-V 64"),
+            Self::PowerPc => write!(f, "PowerPC"),
+            Self::PowerPc64 => write!(f, "PowerPC64"),
+            Self::Sparc => write!(f, "SPARC"),
+            Self::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    Function,
+    Data,
+    Import,
+    Export,
+    Section,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadSymbol {
+    pub name: String,
+    pub address: u64,
+    pub size: u64,
+    pub kind: SymbolKind,
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SectionFlags: u32 {
+        const READ    = 0x4;
+        const WRITE   = 0x2;
+        const EXECUTE = 0x1;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Section {
+    pub name: String,
+    pub address: u64,
+    pub size: u64,
+    pub flags: SectionFlags,
+}
+
+#[derive(Debug)]
+pub struct BinaryInfo {
+    pub format: BinaryFormat,
+    pub arch: Architecture,
+    pub endian: Endian,
+    pub bits: u32,
+    pub entry_point: u64,
+    pub sections: Vec<Section>,
+    pub symbols: Vec<LoadSymbol>,
+    pub memory: Memory,
+}
+
+pub struct BinaryLoader;
+
+impl BinaryLoader {
+    pub fn load(path: &Path) -> Result<BinaryInfo, LoaderError> {
+        let data = std::fs::read(path)?;
+        Self::load_bytes(&data)
+    }
+
+    pub fn load_bytes(data: &[u8]) -> Result<BinaryInfo, LoaderError> {
+        match Object::parse(data).map_err(|e| LoaderError::Parse(e.to_string()))? {
+            Object::Elf(elf) => Self::load_elf(&elf, data),
+            Object::PE(pe) => Self::load_pe(&pe, data),
+            Object::Mach(mach) => Self::load_mach(&mach, data),
+            _ => Err(LoaderError::UnsupportedFormat),
+        }
+    }
+
+    fn load_elf(elf: &goblin::elf::Elf, data: &[u8]) -> Result<BinaryInfo, LoaderError> {
+        let endian = if elf.little_endian {
+            Endian::Little
+        } else {
+            Endian::Big
+        };
+        let bits = if elf.is_64 { 64 } else { 32 };
+        let arch = Self::elf_arch(elf);
+
+        let ram_space = SpaceId(1);
+        let mut memory = Memory::new(ram_space, endian);
+
+        let mut sections = Vec::new();
+        for sh in &elf.section_headers {
+            let name = elf
+                .shdr_strtab
+                .get_at(sh.sh_name)
+                .unwrap_or("")
+                .to_string();
+            if sh.sh_type == goblin::elf::section_header::SHT_NULL {
+                continue;
+            }
+
+            let mut flags = SectionFlags::empty();
+            if sh.sh_flags as u32 & goblin::elf::section_header::SHF_WRITE != 0 {
+                flags |= SectionFlags::WRITE;
+            }
+            if sh.sh_flags as u32 & goblin::elf::section_header::SHF_EXECINSTR != 0 {
+                flags |= SectionFlags::EXECUTE;
+            }
+            if sh.sh_flags as u32 & goblin::elf::section_header::SHF_ALLOC != 0 {
+                flags |= SectionFlags::READ;
+            }
+
+            sections.push(Section {
+                name: name.clone(),
+                address: sh.sh_addr,
+                size: sh.sh_size,
+                flags,
+            });
+
+            if sh.sh_type == goblin::elf::section_header::SHT_PROGBITS
+                && sh.sh_addr != 0
+                && sh.sh_size > 0
+            {
+                let file_offset = sh.sh_offset as usize;
+                let file_end = file_offset + sh.sh_size as usize;
+                let block_data = if file_end <= data.len() {
+                    Some(Arc::from(&data[file_offset..file_end]))
+                } else {
+                    None
+                };
+
+                let mut mem_flags = MemoryFlags::empty();
+                if flags.contains(SectionFlags::READ) {
+                    mem_flags |= MemoryFlags::READ;
+                }
+                if flags.contains(SectionFlags::WRITE) {
+                    mem_flags |= MemoryFlags::WRITE;
+                }
+                if flags.contains(SectionFlags::EXECUTE) {
+                    mem_flags |= MemoryFlags::EXECUTE;
+                }
+
+                memory.add_block(MemoryBlock {
+                    name,
+                    start: sh.sh_addr,
+                    size: sh.sh_size,
+                    flags: mem_flags,
+                    data: block_data,
+                });
+            }
+        }
+
+        let mut symbols = Vec::new();
+        for sym in elf.syms.iter() {
+            let name = elf.strtab.get_at(sym.st_name).unwrap_or("").to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let kind = match goblin::elf::sym::st_type(sym.st_info) {
+                goblin::elf::sym::STT_FUNC => SymbolKind::Function,
+                goblin::elf::sym::STT_OBJECT => SymbolKind::Data,
+                goblin::elf::sym::STT_SECTION => SymbolKind::Section,
+                _ => SymbolKind::Unknown,
+            };
+            symbols.push(LoadSymbol {
+                name,
+                address: sym.st_value,
+                size: sym.st_size,
+                kind,
+            });
+        }
+
+        for sym in elf.dynsyms.iter() {
+            let name = elf.dynstrtab.get_at(sym.st_name).unwrap_or("").to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let kind = if sym.is_import() {
+                SymbolKind::Import
+            } else {
+                match goblin::elf::sym::st_type(sym.st_info) {
+                    goblin::elf::sym::STT_FUNC => SymbolKind::Function,
+                    goblin::elf::sym::STT_OBJECT => SymbolKind::Data,
+                    _ => SymbolKind::Unknown,
+                }
+            };
+            symbols.push(LoadSymbol {
+                name,
+                address: sym.st_value,
+                size: sym.st_size,
+                kind,
+            });
+        }
+
+        Ok(BinaryInfo {
+            format: BinaryFormat::Elf,
+            arch,
+            endian,
+            bits,
+            entry_point: elf.entry,
+            sections,
+            symbols,
+            memory,
+        })
+    }
+
+    fn elf_arch(elf: &goblin::elf::Elf) -> Architecture {
+        match elf.header.e_machine {
+            goblin::elf::header::EM_386 => Architecture::X86,
+            goblin::elf::header::EM_X86_64 => Architecture::X86_64,
+            goblin::elf::header::EM_ARM => Architecture::Arm,
+            goblin::elf::header::EM_AARCH64 => Architecture::Arm64,
+            goblin::elf::header::EM_MIPS => {
+                if elf.is_64 {
+                    Architecture::Mips64
+                } else {
+                    Architecture::Mips
+                }
+            }
+            goblin::elf::header::EM_PPC => Architecture::PowerPc,
+            goblin::elf::header::EM_PPC64 => Architecture::PowerPc64,
+            goblin::elf::header::EM_SPARC | goblin::elf::header::EM_SPARCV9 => Architecture::Sparc,
+            goblin::elf::header::EM_RISCV => {
+                if elf.is_64 {
+                    Architecture::Riscv64
+                } else {
+                    Architecture::Riscv32
+                }
+            }
+            _ => Architecture::Unknown,
+        }
+    }
+
+    fn load_pe(pe: &goblin::pe::PE, data: &[u8]) -> Result<BinaryInfo, LoaderError> {
+        let bits = if pe.is_64 { 64 } else { 32 };
+        let arch = if pe.is_64 {
+            Architecture::X86_64
+        } else {
+            Architecture::X86
+        };
+
+        let image_base = pe.image_base as u64;
+        let ram_space = SpaceId(1);
+        let mut memory = Memory::new(ram_space, Endian::Little);
+
+        let mut sections = Vec::new();
+        for section in &pe.sections {
+            let name = String::from_utf8_lossy(
+                &section.name[..section.name.iter().position(|&b| b == 0).unwrap_or(section.name.len())],
+            )
+            .to_string();
+
+            let chars = section.characteristics;
+            let mut flags = SectionFlags::empty();
+            if chars & goblin::pe::section_table::IMAGE_SCN_MEM_READ != 0 {
+                flags |= SectionFlags::READ;
+            }
+            if chars & goblin::pe::section_table::IMAGE_SCN_MEM_WRITE != 0 {
+                flags |= SectionFlags::WRITE;
+            }
+            if chars & goblin::pe::section_table::IMAGE_SCN_MEM_EXECUTE != 0 {
+                flags |= SectionFlags::EXECUTE;
+            }
+
+            let vaddr = image_base + section.virtual_address as u64;
+            let vsize = section.virtual_size as u64;
+            sections.push(Section {
+                name: name.clone(),
+                address: vaddr,
+                size: vsize,
+                flags,
+            });
+
+            let raw_offset = section.pointer_to_raw_data as usize;
+            let raw_size = section.size_of_raw_data as usize;
+            let block_data = if raw_size > 0 && raw_offset + raw_size <= data.len() {
+                Some(Arc::from(&data[raw_offset..raw_offset + raw_size]))
+            } else {
+                None
+            };
+
+            let mut mem_flags = MemoryFlags::empty();
+            if flags.contains(SectionFlags::READ) {
+                mem_flags |= MemoryFlags::READ;
+            }
+            if flags.contains(SectionFlags::WRITE) {
+                mem_flags |= MemoryFlags::WRITE;
+            }
+            if flags.contains(SectionFlags::EXECUTE) {
+                mem_flags |= MemoryFlags::EXECUTE;
+            }
+
+            memory.add_block(MemoryBlock {
+                name,
+                start: vaddr,
+                size: vsize,
+                flags: mem_flags,
+                data: block_data,
+            });
+        }
+
+        let mut symbols = Vec::new();
+        for export in &pe.exports {
+            if let Some(ref name) = export.name {
+                symbols.push(LoadSymbol {
+                    name: name.to_string(),
+                    address: export.rva as u64 + image_base,
+                    size: 0,
+                    kind: SymbolKind::Export,
+                });
+            }
+        }
+        for import in &pe.imports {
+            symbols.push(LoadSymbol {
+                name: import.name.to_string(),
+                address: import.rva as u64 + image_base,
+                size: 0,
+                kind: SymbolKind::Import,
+            });
+        }
+
+        let entry = pe
+            .header
+            .optional_header
+            .map(|oh| oh.standard_fields.address_of_entry_point + image_base)
+            .unwrap_or(0);
+
+        Ok(BinaryInfo {
+            format: BinaryFormat::Pe,
+            arch,
+            endian: Endian::Little,
+            bits,
+            entry_point: entry,
+            sections,
+            symbols,
+            memory,
+        })
+    }
+
+    fn load_mach(mach: &goblin::mach::Mach, data: &[u8]) -> Result<BinaryInfo, LoaderError> {
+        match mach {
+            goblin::mach::Mach::Binary(macho) => Self::load_macho_single(macho, data),
+            goblin::mach::Mach::Fat(fat) => {
+                match fat.get(0).map_err(|e| LoaderError::Parse(e.to_string()))? {
+                    goblin::mach::SingleArch::MachO(macho) => {
+                        Self::load_macho_single(&macho, data)
+                    }
+                    _ => Err(LoaderError::UnsupportedFormat),
+                }
+            }
+        }
+    }
+
+    fn load_macho_single(
+        macho: &goblin::mach::MachO,
+        data: &[u8],
+    ) -> Result<BinaryInfo, LoaderError> {
+        let endian = if macho.little_endian {
+            Endian::Little
+        } else {
+            Endian::Big
+        };
+        let bits = if macho.is_64 { 64 } else { 32 };
+        let arch = Self::mach_arch(macho);
+
+        let ram_space = SpaceId(1);
+        let mut memory = Memory::new(ram_space, endian);
+
+        let mut sections = Vec::new();
+        for segment in macho.segments.iter() {
+            for (sec, _) in segment.sections().unwrap_or_default() {
+                let sect_name = String::from_utf8_lossy(&sec.sectname)
+                    .trim_end_matches('\0')
+                    .to_string();
+                let seg_name = String::from_utf8_lossy(&sec.segname)
+                    .trim_end_matches('\0')
+                    .to_string();
+                let full_name = format!("{}.{}", seg_name, sect_name);
+
+                let mut flags = SectionFlags::READ;
+                if seg_name == "__DATA" || seg_name == "__DATA_CONST" {
+                    flags |= SectionFlags::WRITE;
+                }
+                if seg_name == "__TEXT" {
+                    flags |= SectionFlags::EXECUTE;
+                }
+
+                sections.push(Section {
+                    name: full_name.clone(),
+                    address: sec.addr,
+                    size: sec.size,
+                    flags,
+                });
+
+                let offset = sec.offset as usize;
+                let sz = sec.size as usize;
+                let block_data = if sz > 0 && offset + sz <= data.len() {
+                    Some(Arc::from(&data[offset..offset + sz]))
+                } else {
+                    None
+                };
+
+                let mut mem_flags = MemoryFlags::READ;
+                if flags.contains(SectionFlags::WRITE) {
+                    mem_flags |= MemoryFlags::WRITE;
+                }
+                if flags.contains(SectionFlags::EXECUTE) {
+                    mem_flags |= MemoryFlags::EXECUTE;
+                }
+
+                memory.add_block(MemoryBlock {
+                    name: full_name,
+                    start: sec.addr,
+                    size: sec.size,
+                    flags: mem_flags,
+                    data: block_data,
+                });
+            }
+        }
+
+        let mut symbols = Vec::new();
+        if let Some(ref syms) = macho.symbols {
+            for (name, nlist) in syms.iter().flatten() {
+                if name.is_empty() {
+                    continue;
+                }
+                let clean_name = name.strip_prefix('_').unwrap_or(name).to_string();
+                let kind = if nlist.is_undefined() {
+                    SymbolKind::Import
+                } else if nlist.n_type & 0x0e == 0x0e {
+                    SymbolKind::Function
+                } else {
+                    SymbolKind::Unknown
+                };
+                symbols.push(LoadSymbol {
+                    name: clean_name,
+                    address: nlist.n_value,
+                    size: 0,
+                    kind,
+                });
+            }
+        }
+
+        Ok(BinaryInfo {
+            format: BinaryFormat::MachO,
+            arch,
+            endian,
+            bits,
+            entry_point: macho.entry,
+            sections,
+            symbols,
+            memory,
+        })
+    }
+
+    fn mach_arch(macho: &goblin::mach::MachO) -> Architecture {
+        use goblin::mach::cputype::*;
+        match macho.header.cputype() {
+            CPU_TYPE_X86 => Architecture::X86,
+            CPU_TYPE_X86_64 => Architecture::X86_64,
+            CPU_TYPE_ARM => Architecture::Arm,
+            CPU_TYPE_ARM64 => Architecture::Arm64,
+            CPU_TYPE_POWERPC => Architecture::PowerPc,
+            CPU_TYPE_POWERPC64 => Architecture::PowerPc64,
+            _ => Architecture::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for BinaryFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Elf => write!(f, "ELF"),
+            Self::Pe => write!(f, "PE"),
+            Self::MachO => write!(f, "Mach-O"),
+            Self::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+impl std::fmt::Display for SymbolKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Function => write!(f, "FUNC"),
+            Self::Data => write!(f, "DATA"),
+            Self::Import => write!(f, "IMPORT"),
+            Self::Export => write!(f, "EXPORT"),
+            Self::Section => write!(f, "SECTION"),
+            Self::Unknown => write!(f, "UNKNOWN"),
+        }
+    }
+}
