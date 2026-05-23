@@ -11,6 +11,10 @@ const RAM_SPACE: SpaceId = SpaceId(1);
 const REG_SPACE: SpaceId = SpaceId(2);
 const UNIQUE_SPACE: SpaceId = SpaceId(3);
 
+const ZF_OFFSET: u64 = 0x206;
+const SF_OFFSET: u64 = 0x207;
+const CF_OFFSET: u64 = 0x201;
+
 fn reg(offset: u64, size: u32) -> VarnodeData {
     VarnodeData::new(REG_SPACE, offset, size)
 }
@@ -114,147 +118,102 @@ impl X86Lifter {
         use iced_x86::Mnemonic::*;
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
         let mut ops: Vec<PcodeOp> = Vec::new();
+        let mut seq_base: u32 = 0;
         let ps = self.ptr_size();
 
         match insn.mnemonic() {
             Nop | Endbr64 | Endbr32 => {}
 
             Mov => {
-                let (dst, src) = self.lift_two_operands(insn)?;
+                let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
                 ops.push(PcodeOp {
                     opcode: OpCode::Copy,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[src]),
                 });
+                seq_base += 1;
+                self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
             Push => {
-                let src = self.lift_operand(insn, 0)?;
+                let src = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let sp = self.sp();
-                let decr = constant(src.size as u64, ps);
-                // RSP = RSP - size
                 ops.push(PcodeOp {
                     opcode: OpCode::IntSub,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(sp),
-                    inputs: SmallVec::from_slice(&[sp, decr]),
+                    inputs: SmallVec::from_slice(&[sp, constant(src.size as u64, ps)]),
                 });
-                // STORE [RSP] = src
+                seq_base += 1;
                 ops.push(PcodeOp {
                     opcode: OpCode::Store,
-                    seq: seq(1),
+                    seq: seq(seq_base),
                     output: None,
                     inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), sp, src]),
                 });
             }
 
             Pop => {
-                let dst = self.lift_operand(insn, 0)?;
+                let dst = self.lift_operand_no_load(insn, 0, &mut ops, &mut seq_base, address)?;
                 let sp = self.sp();
-                // dst = LOAD [RSP]
+                let pop_size = if insn.op_kind(0) == iced_x86::OpKind::Register {
+                    iced_reg_to_varnode(insn.op_register(0)).map(|v| v.size).unwrap_or(ps)
+                } else {
+                    ps
+                };
+                let loaded = unique(seq_base as u64 * 0x10 + 0x700, pop_size);
                 ops.push(PcodeOp {
                     opcode: OpCode::Load,
-                    seq: seq(0),
-                    output: Some(dst),
+                    seq: seq(seq_base),
+                    output: Some(loaded),
                     inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), sp]),
                 });
-                // RSP = RSP + size
-                let incr = constant(dst.size as u64, ps);
+                seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::Copy,
+                    seq: seq(seq_base),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[loaded]),
+                });
+                seq_base += 1;
                 ops.push(PcodeOp {
                     opcode: OpCode::IntAdd,
-                    seq: seq(1),
+                    seq: seq(seq_base),
                     output: Some(sp),
-                    inputs: SmallVec::from_slice(&[sp, incr]),
+                    inputs: SmallVec::from_slice(&[sp, constant(pop_size as u64, ps)]),
                 });
             }
 
-            Add => {
-                let (dst, src) = self.lift_two_operands(insn)?;
+            Add | Sub | And | Or | Xor | Shl | Shr | Sar => {
+                let opcode = match insn.mnemonic() {
+                    Add => OpCode::IntAdd,
+                    Sub => OpCode::IntSub,
+                    And => OpCode::IntAnd,
+                    Or => OpCode::IntOr,
+                    Xor => OpCode::IntXor,
+                    Shl => OpCode::IntLeft,
+                    Shr => OpCode::IntRight,
+                    Sar => OpCode::IntSRight,
+                    _ => unreachable!(),
+                };
+                let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
                 ops.push(PcodeOp {
-                    opcode: OpCode::IntAdd,
-                    seq: seq(0),
+                    opcode,
+                    seq: seq(seq_base),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[dst, src]),
                 });
-            }
-
-            Sub => {
-                let (dst, src) = self.lift_two_operands(insn)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::IntSub,
-                    seq: seq(0),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, src]),
-                });
-            }
-
-            And => {
-                let (dst, src) = self.lift_two_operands(insn)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::IntAnd,
-                    seq: seq(0),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, src]),
-                });
-            }
-
-            Or => {
-                let (dst, src) = self.lift_two_operands(insn)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::IntOr,
-                    seq: seq(0),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, src]),
-                });
-            }
-
-            Xor => {
-                let (dst, src) = self.lift_two_operands(insn)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::IntXor,
-                    seq: seq(0),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, src]),
-                });
-            }
-
-            Shl => {
-                let (dst, src) = self.lift_two_operands(insn)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::IntLeft,
-                    seq: seq(0),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, src]),
-                });
-            }
-
-            Shr => {
-                let (dst, src) = self.lift_two_operands(insn)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::IntRight,
-                    seq: seq(0),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, src]),
-                });
-            }
-
-            Sar => {
-                let (dst, src) = self.lift_two_operands(insn)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::IntSRight,
-                    seq: seq(0),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, src]),
-                });
+                seq_base += 1;
+                self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
             Imul => {
                 if insn.op_count() >= 2 {
-                    let (dst, src) = self.lift_two_operands(insn)?;
+                    let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
                     ops.push(PcodeOp {
                         opcode: OpCode::IntMult,
-                        seq: seq(0),
+                        seq: seq(seq_base),
                         output: Some(dst),
                         inputs: SmallVec::from_slice(&[dst, src]),
                     });
@@ -262,119 +221,143 @@ impl X86Lifter {
             }
 
             Not => {
-                let dst = self.lift_operand(insn, 0)?;
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 ops.push(PcodeOp {
                     opcode: OpCode::IntNegate,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[dst]),
                 });
+                seq_base += 1;
+                self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
             Neg => {
-                let dst = self.lift_operand(insn, 0)?;
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 ops.push(PcodeOp {
                     opcode: OpCode::Int2Comp,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[dst]),
                 });
+                seq_base += 1;
+                self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
             Inc => {
-                let dst = self.lift_operand(insn, 0)?;
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 ops.push(PcodeOp {
                     opcode: OpCode::IntAdd,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[dst, constant(1, dst.size)]),
                 });
+                seq_base += 1;
+                self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
             Dec => {
-                let dst = self.lift_operand(insn, 0)?;
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 ops.push(PcodeOp {
                     opcode: OpCode::IntSub,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[dst, constant(1, dst.size)]),
                 });
+                seq_base += 1;
+                self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
             Cmp => {
-                let (left, right) = self.lift_two_operands(insn)?;
+                let (left, right) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
                 let tmp = unique(0x100, left.size);
                 ops.push(PcodeOp {
                     opcode: OpCode::IntSub,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(tmp),
                     inputs: SmallVec::from_slice(&[left, right]),
                 });
-                // ZF
-                let zf = unique(0x200, 1);
+                seq_base += 1;
+                let zf = reg(ZF_OFFSET, 1);
                 ops.push(PcodeOp {
                     opcode: OpCode::IntEqual,
-                    seq: seq(1),
+                    seq: seq(seq_base),
                     output: Some(zf),
                     inputs: SmallVec::from_slice(&[tmp, constant(0, tmp.size)]),
                 });
-                // SF
-                let sf = unique(0x208, 1);
+                seq_base += 1;
+                let sf = reg(SF_OFFSET, 1);
                 ops.push(PcodeOp {
                     opcode: OpCode::IntSLess,
-                    seq: seq(2),
+                    seq: seq(seq_base),
+                    output: Some(sf),
+                    inputs: SmallVec::from_slice(&[tmp, constant(0, tmp.size)]),
+                });
+                seq_base += 1;
+                let cf = reg(CF_OFFSET, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntLess,
+                    seq: seq(seq_base),
+                    output: Some(cf),
+                    inputs: SmallVec::from_slice(&[left, right]),
+                });
+            }
+
+            Test => {
+                let (left, right) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
+                let tmp = unique(0x100, left.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntAnd,
+                    seq: seq(seq_base),
+                    output: Some(tmp),
+                    inputs: SmallVec::from_slice(&[left, right]),
+                });
+                seq_base += 1;
+                let zf = reg(ZF_OFFSET, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntEqual,
+                    seq: seq(seq_base),
+                    output: Some(zf),
+                    inputs: SmallVec::from_slice(&[tmp, constant(0, tmp.size)]),
+                });
+                seq_base += 1;
+                let sf = reg(SF_OFFSET, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntSLess,
+                    seq: seq(seq_base),
                     output: Some(sf),
                     inputs: SmallVec::from_slice(&[tmp, constant(0, tmp.size)]),
                 });
             }
 
-            Test => {
-                let (left, right) = self.lift_two_operands(insn)?;
-                let tmp = unique(0x100, left.size);
-                ops.push(PcodeOp {
-                    opcode: OpCode::IntAnd,
-                    seq: seq(0),
-                    output: Some(tmp),
-                    inputs: SmallVec::from_slice(&[left, right]),
-                });
-                let zf = unique(0x200, 1);
-                ops.push(PcodeOp {
-                    opcode: OpCode::IntEqual,
-                    seq: seq(1),
-                    output: Some(zf),
-                    inputs: SmallVec::from_slice(&[tmp, constant(0, tmp.size)]),
-                });
-            }
-
             Lea => {
-                let dst = self.lift_operand(insn, 0)?;
-                if let Some(addr_val) = self.compute_lea_address(insn) {
-                    ops.push(PcodeOp {
-                        opcode: OpCode::Copy,
-                        seq: seq(0),
-                        output: Some(dst),
-                        inputs: SmallVec::from_slice(&[constant(addr_val, dst.size)]),
-                    });
-                }
+                let dst = self.lift_operand_no_load(insn, 0, &mut ops, &mut seq_base, address)?;
+                let addr_vn = self.compute_memory_address(insn, &mut ops, &mut seq_base, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::Copy,
+                    seq: seq(seq_base),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[addr_vn]),
+                });
             }
 
             Movzx => {
-                let dst = self.lift_operand(insn, 0)?;
-                let src = self.lift_operand(insn, 1)?;
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
                 ops.push(PcodeOp {
                     opcode: OpCode::IntZExt,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[src]),
                 });
             }
 
             Movsx | Movsxd => {
-                let dst = self.lift_operand(insn, 0)?;
-                let src = self.lift_operand(insn, 1)?;
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
                 ops.push(PcodeOp {
                     opcode: OpCode::IntSExt,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[src]),
                 });
@@ -383,17 +366,16 @@ impl X86Lifter {
             Call => {
                 let sp = self.sp();
                 let ret_addr = address + insn.len() as u64;
-                // RSP = RSP - ptr_size
                 ops.push(PcodeOp {
                     opcode: OpCode::IntSub,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(sp),
                     inputs: SmallVec::from_slice(&[sp, constant(ps as u64, ps)]),
                 });
-                // STORE [RSP] = return_address
+                seq_base += 1;
                 ops.push(PcodeOp {
                     opcode: OpCode::Store,
-                    seq: seq(1),
+                    seq: seq(seq_base),
                     output: None,
                     inputs: SmallVec::from_slice(&[
                         constant(RAM_SPACE.0 as u64, 4),
@@ -401,11 +383,11 @@ impl X86Lifter {
                         constant(ret_addr, ps),
                     ]),
                 });
-                // CALL target
+                seq_base += 1;
                 let target = insn.near_branch_target();
                 ops.push(PcodeOp {
                     opcode: OpCode::Call,
-                    seq: seq(2),
+                    seq: seq(seq_base),
                     output: None,
                     inputs: SmallVec::from_slice(&[ram(target, ps)]),
                 });
@@ -414,24 +396,23 @@ impl X86Lifter {
             Ret => {
                 let sp = self.sp();
                 let ret_tmp = unique(0x300, ps);
-                // ret_tmp = LOAD [RSP]
                 ops.push(PcodeOp {
                     opcode: OpCode::Load,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: Some(ret_tmp),
                     inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), sp]),
                 });
-                // RSP = RSP + ptr_size
+                seq_base += 1;
                 ops.push(PcodeOp {
                     opcode: OpCode::IntAdd,
-                    seq: seq(1),
+                    seq: seq(seq_base),
                     output: Some(sp),
                     inputs: SmallVec::from_slice(&[sp, constant(ps as u64, ps)]),
                 });
-                // RETURN ret_tmp
+                seq_base += 1;
                 ops.push(PcodeOp {
                     opcode: OpCode::Return,
-                    seq: seq(2),
+                    seq: seq(seq_base),
                     output: None,
                     inputs: SmallVec::from_slice(&[ret_tmp]),
                 });
@@ -441,34 +422,118 @@ impl X86Lifter {
                 let target = insn.near_branch_target();
                 ops.push(PcodeOp {
                     opcode: OpCode::Branch,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: None,
                     inputs: SmallVec::from_slice(&[ram(target, ps)]),
                 });
             }
 
-            Je | Jne | Jl | Jge | Jle | Jg | Jb | Jae | Jbe | Ja
-            | Js | Jns | Jo | Jno | Jp | Jnp => {
+            Je => {
                 let target = insn.near_branch_target();
-                let cond = unique(0x400, 1);
-                ops.push(PcodeOp {
-                    opcode: OpCode::Copy,
-                    seq: seq(0),
-                    output: Some(cond),
-                    inputs: SmallVec::from_slice(&[constant(1, 1)]),
-                });
+                let zf = reg(ZF_OFFSET, 1);
                 ops.push(PcodeOp {
                     opcode: OpCode::CBranch,
-                    seq: seq(1),
+                    seq: seq(seq_base),
                     output: None,
-                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
+                    inputs: SmallVec::from_slice(&[ram(target, ps), zf]),
+                });
+            }
+
+            Jne => {
+                let target = insn.near_branch_target();
+                let zf = reg(ZF_OFFSET, 1);
+                let not_zf = unique(0x410, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::BoolNegate,
+                    seq: seq(seq_base),
+                    output: Some(not_zf),
+                    inputs: SmallVec::from_slice(&[zf]),
+                });
+                seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), not_zf]),
+                });
+            }
+
+            Jl => {
+                let target = insn.near_branch_target();
+                let sf = reg(SF_OFFSET, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), sf]),
+                });
+            }
+
+            Jge => {
+                let target = insn.near_branch_target();
+                let sf = reg(SF_OFFSET, 1);
+                let not_sf = unique(0x420, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::BoolNegate,
+                    seq: seq(seq_base),
+                    output: Some(not_sf),
+                    inputs: SmallVec::from_slice(&[sf]),
+                });
+                seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), not_sf]),
+                });
+            }
+
+            Jb => {
+                let target = insn.near_branch_target();
+                let cf = reg(CF_OFFSET, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cf]),
+                });
+            }
+
+            Jae => {
+                let target = insn.near_branch_target();
+                let cf = reg(CF_OFFSET, 1);
+                let not_cf = unique(0x430, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::BoolNegate,
+                    seq: seq(seq_base),
+                    output: Some(not_cf),
+                    inputs: SmallVec::from_slice(&[cf]),
+                });
+                seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), not_cf]),
+                });
+            }
+
+            Jle | Jg | Ja | Jbe
+            | Js | Jns | Jo | Jno | Jp | Jnp => {
+                let target = insn.near_branch_target();
+                let zf = reg(ZF_OFFSET, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), zf]),
                 });
             }
 
             Int3 => {
                 ops.push(PcodeOp {
                     opcode: OpCode::CallOther,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: None,
                     inputs: SmallVec::from_slice(&[constant(3, 4)]),
                 });
@@ -477,17 +542,25 @@ impl X86Lifter {
             _ => {
                 ops.push(PcodeOp {
                     opcode: OpCode::CallOther,
-                    seq: seq(0),
+                    seq: seq(seq_base),
                     output: None,
                     inputs: SmallVec::from_slice(&[constant(0, 4)]),
                 });
             }
         }
 
+        let _ = seq_base;
         Ok(ops)
     }
 
-    fn lift_operand(&self, insn: &iced_x86::Instruction, idx: u32) -> Result<VarnodeData, LiftError> {
+    fn lift_operand(
+        &self,
+        insn: &iced_x86::Instruction,
+        idx: u32,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) -> Result<VarnodeData, LiftError> {
         use iced_x86::OpKind;
         let addr = insn.ip();
         match insn.op_kind(idx) {
@@ -510,7 +583,17 @@ impl X86Lifter {
                 if size == 0 {
                     return Ok(constant(0, self.ptr_size()));
                 }
-                Ok(ram(0, size))
+                let addr_vn = self.compute_memory_address(insn, ops, seq_base, address)?;
+                let result = unique(*seq_base as u64 * 0x10 + 0x500, size);
+                let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
+                *seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::Load,
+                    seq,
+                    output: Some(result),
+                    inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr_vn]),
+                });
+                Ok(result)
             }
             OpKind::NearBranch16 => Ok(ram(insn.near_branch16() as u64, 2)),
             OpKind::NearBranch32 => Ok(ram(insn.near_branch32() as u64, 4)),
@@ -522,28 +605,145 @@ impl X86Lifter {
         }
     }
 
+    fn lift_operand_no_load(
+        &self,
+        insn: &iced_x86::Instruction,
+        idx: u32,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) -> Result<VarnodeData, LiftError> {
+        use iced_x86::OpKind;
+        match insn.op_kind(idx) {
+            OpKind::Memory => {
+                self.compute_memory_address(insn, ops, seq_base, address)
+            }
+            _ => self.lift_operand(insn, idx, ops, seq_base, address),
+        }
+    }
+
+    fn compute_memory_address(
+        &self,
+        insn: &iced_x86::Instruction,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) -> Result<VarnodeData, LiftError> {
+        let ps = self.ptr_size();
+        let base_reg = insn.memory_base();
+        let index_reg = insn.memory_index();
+        let scale = insn.memory_index_scale() as u64;
+        let disp = insn.memory_displacement64();
+
+        if base_reg == iced_x86::Register::RIP || base_reg == iced_x86::Register::EIP {
+            let effective = insn.ip().wrapping_add(insn.len() as u64).wrapping_add(disp);
+            return Ok(constant(effective, ps));
+        }
+
+        let has_base = base_reg != iced_x86::Register::None;
+        let has_index = index_reg != iced_x86::Register::None;
+        let has_disp = disp != 0;
+
+        if !has_base && !has_index {
+            return Ok(constant(disp, ps));
+        }
+
+        let mut result = if has_base {
+            iced_reg_to_varnode(base_reg).unwrap_or(constant(0, ps))
+        } else {
+            constant(0, ps)
+        };
+
+        if has_index {
+            let idx_vn = iced_reg_to_varnode(index_reg).unwrap_or(constant(0, ps));
+            if scale > 1 {
+                let scaled = unique(*seq_base as u64 * 0x10 + 0x600, ps);
+                let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
+                *seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntMult,
+                    seq,
+                    output: Some(scaled),
+                    inputs: SmallVec::from_slice(&[idx_vn, constant(scale, ps)]),
+                });
+                let added = unique(*seq_base as u64 * 0x10 + 0x600, ps);
+                let seq2 = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
+                *seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntAdd,
+                    seq: seq2,
+                    output: Some(added),
+                    inputs: SmallVec::from_slice(&[result, scaled]),
+                });
+                result = added;
+            } else {
+                let added = unique(*seq_base as u64 * 0x10 + 0x600, ps);
+                let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
+                *seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntAdd,
+                    seq,
+                    output: Some(added),
+                    inputs: SmallVec::from_slice(&[result, idx_vn]),
+                });
+                result = added;
+            }
+        }
+
+        if has_disp {
+            let with_disp = unique(*seq_base as u64 * 0x10 + 0x600, ps);
+            let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
+            *seq_base += 1;
+            ops.push(PcodeOp {
+                opcode: OpCode::IntAdd,
+                seq,
+                output: Some(with_disp),
+                inputs: SmallVec::from_slice(&[result, constant(disp, ps)]),
+            });
+            result = with_disp;
+        }
+
+        Ok(result)
+    }
+
     fn lift_two_operands(
         &self,
         insn: &iced_x86::Instruction,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
     ) -> Result<(VarnodeData, VarnodeData), LiftError> {
-        let dst = self.lift_operand(insn, 0)?;
-        let src = self.lift_operand(insn, 1)?;
+        let dst = self.lift_operand(insn, 0, ops, seq_base, address)?;
+        let src_raw = self.lift_operand(insn, 1, ops, seq_base, address)?;
+        let src = if src_raw.size != dst.size && src_raw.space == CONST_SPACE {
+            constant(src_raw.offset, dst.size)
+        } else {
+            src_raw
+        };
         Ok((dst, src))
     }
 
-    fn compute_lea_address(&self, insn: &iced_x86::Instruction) -> Option<u64> {
-        if insn.op_kind(1) == iced_x86::OpKind::Memory {
-            let disp = insn.memory_displacement64();
-            if insn.memory_base() == iced_x86::Register::RIP {
-                return Some(insn.ip().wrapping_add(insn.len() as u64).wrapping_add(disp));
-            }
-            if insn.memory_base() == iced_x86::Register::None
-                && insn.memory_index() == iced_x86::Register::None
-            {
-                return Some(disp);
-            }
+    fn write_back_if_memory(
+        &self,
+        insn: &iced_x86::Instruction,
+        idx: u32,
+        value: VarnodeData,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) -> Result<(), LiftError> {
+        if insn.op_kind(idx) == iced_x86::OpKind::Memory {
+            let addr_vn = self.compute_memory_address(insn, ops, seq_base, address)?;
+            let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
+            *seq_base += 1;
+            ops.push(PcodeOp {
+                opcode: OpCode::Store,
+                seq,
+                output: None,
+                inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr_vn, value]),
+            });
         }
-        None
+        Ok(())
     }
 }
 
@@ -642,9 +842,10 @@ mod tests {
         // pop rbp = 0x5d
         let mem = make_memory(&[0x5d], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(lifted.ops.len(), 2);
+        assert_eq!(lifted.ops.len(), 3);
         assert_eq!(lifted.ops[0].opcode, OpCode::Load);
-        assert_eq!(lifted.ops[1].opcode, OpCode::IntAdd);
+        assert_eq!(lifted.ops[1].opcode, OpCode::Copy);
+        assert_eq!(lifted.ops[2].opcode, OpCode::IntAdd);
     }
 
     #[test]
@@ -707,10 +908,11 @@ mod tests {
         // cmp eax, 0 = 83 f8 00
         let mem = make_memory(&[0x83, 0xf8, 0x00], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(lifted.ops.len(), 3);
+        assert_eq!(lifted.ops.len(), 4);
         assert_eq!(lifted.ops[0].opcode, OpCode::IntSub);
         assert_eq!(lifted.ops[1].opcode, OpCode::IntEqual);
         assert_eq!(lifted.ops[2].opcode, OpCode::IntSLess);
+        assert_eq!(lifted.ops[3].opcode, OpCode::IntLess);
     }
 
     #[test]
@@ -719,8 +921,8 @@ mod tests {
         // je +0x10 = 74 10
         let mem = make_memory(&[0x74, 0x10], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(lifted.ops.len(), 2);
-        assert_eq!(lifted.ops[1].opcode, OpCode::CBranch);
+        assert_eq!(lifted.ops.len(), 1);
+        assert_eq!(lifted.ops[0].opcode, OpCode::CBranch);
     }
 
     #[test]

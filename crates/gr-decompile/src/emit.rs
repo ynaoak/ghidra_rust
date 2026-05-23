@@ -23,7 +23,8 @@ impl CEmitter {
         structured: &StructuredBlock,
     ) -> String {
         self.output.clear();
-        self.line(&format!("void {}(void)", func.name));
+        let sig = infer_signature(func);
+        self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
         self.indent += 1;
         self.emit_var_declarations(func);
@@ -295,6 +296,66 @@ impl Default for CEmitter {
     }
 }
 
+struct FunctionSignature {
+    return_type: &'static str,
+    params: Vec<(String, String)>,
+}
+
+impl FunctionSignature {
+    fn to_c_declaration(&self, name: &str) -> String {
+        if self.params.is_empty() {
+            format!("{} {}(void)", self.return_type, name)
+        } else {
+            let params: Vec<String> = self
+                .params
+                .iter()
+                .map(|(ty, nm)| format!("{} {}", ty, nm))
+                .collect();
+            format!("{} {}({})", self.return_type, name, params.join(", "))
+        }
+    }
+}
+
+fn infer_signature(func: &SsaFunction) -> FunctionSignature {
+    let has_return_value = func.ops.iter().any(|op| {
+        if op.dead || op.opcode != OpCode::Return {
+            return false;
+        }
+        if op.inputs.is_empty() {
+            return false;
+        }
+        let ret_vn = &func.varnodes[op.inputs[0] as usize];
+        ret_vn.data.space == SpaceId(2) && ret_vn.data.offset == 0x00
+    });
+
+    let return_type = if has_return_value { "uint64_t" } else { "void" };
+
+    let param_regs: &[(u64, &str)] = &[
+        (0x08, "param_1"),  // RCX (Win) / RDI (SysV) - simplified
+        (0x10, "param_2"),  // RDX / RSI
+        (0x80, "param_3"),  // R8 / RDX
+        (0x88, "param_4"),  // R9 / RCX
+    ];
+
+    let mut params = Vec::new();
+    for &(offset, name) in param_regs {
+        let is_input = func.varnodes.iter().any(|vn| {
+            vn.data.space == SpaceId(2)
+                && vn.data.offset == offset
+                && vn.def_op.is_none()
+                && !vn.uses.is_empty()
+        });
+        if is_input {
+            params.push(("uint64_t".to_string(), name.to_string()));
+        }
+    }
+
+    FunctionSignature {
+        return_type,
+        params,
+    }
+}
+
 fn varnode_name(vn: &crate::ssa::SsaVarnode) -> String {
     if vn.data.space == SpaceId(0) {
         if vn.data.offset <= 9 {
@@ -391,7 +452,7 @@ mod tests {
         let mut emitter = CEmitter::new();
         let output = emitter.emit_function(&ssa, &structured);
 
-        assert!(output.contains("void my_func(void)"));
+        assert!(output.contains("my_func(void)"));
         assert!(output.contains("rax = 0x2a"));
         assert!(output.contains("return"));
     }

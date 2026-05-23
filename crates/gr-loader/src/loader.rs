@@ -86,6 +86,13 @@ pub struct Section {
     pub flags: SectionFlags,
 }
 
+#[derive(Debug, Clone)]
+pub struct ImportEntry {
+    pub name: String,
+    pub plt_address: u64,
+    pub got_address: u64,
+}
+
 #[derive(Debug)]
 pub struct BinaryInfo {
     pub format: BinaryFormat,
@@ -95,6 +102,7 @@ pub struct BinaryInfo {
     pub entry_point: u64,
     pub sections: Vec<Section>,
     pub symbols: Vec<LoadSymbol>,
+    pub imports: Vec<ImportEntry>,
     pub memory: Memory,
 }
 
@@ -231,6 +239,35 @@ impl BinaryLoader {
             });
         }
 
+        let mut imports = Vec::new();
+        let plt_section = elf.section_headers.iter().find(|sh| {
+            elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("") == ".plt"
+        });
+        let plt_base = plt_section.map(|sh| sh.sh_addr).unwrap_or(0);
+        let plt_entry_size: u64 = 16;
+
+        for (i, reloc) in elf.pltrelocs.iter().enumerate() {
+            let sym_idx = reloc.r_sym;
+            if let Some(sym) = elf.dynsyms.get(sym_idx) {
+                let name = elf.dynstrtab.get_at(sym.st_name).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    let plt_addr = plt_base + (i as u64 + 1) * plt_entry_size;
+                    let got_addr = reloc.r_offset;
+                    imports.push(ImportEntry {
+                        name: name.clone(),
+                        plt_address: plt_addr,
+                        got_address: got_addr,
+                    });
+                    symbols.push(LoadSymbol {
+                        name: format!("{}@plt", name),
+                        address: plt_addr,
+                        size: plt_entry_size,
+                        kind: SymbolKind::Function,
+                    });
+                }
+            }
+        }
+
         Ok(BinaryInfo {
             format: BinaryFormat::Elf,
             arch,
@@ -239,6 +276,7 @@ impl BinaryLoader {
             entry_point: elf.entry,
             sections,
             symbols,
+            imports,
             memory,
         })
     }
@@ -372,6 +410,7 @@ impl BinaryLoader {
             entry_point: entry,
             sections,
             symbols,
+            imports: Vec::new(),
             memory,
         })
     }
@@ -488,6 +527,7 @@ impl BinaryLoader {
             entry_point: macho.entry,
             sections,
             symbols,
+            imports: Vec::new(),
             memory,
         })
     }
