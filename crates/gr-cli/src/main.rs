@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use gr_analysis::{AnalysisManager, CallGraph};
 use gr_arch::arch::create_architecture;
 use gr_loader::{BinaryLoader, SymbolKind};
+use gr_program::Program;
 
 #[derive(Parser)]
 #[command(name = "ghidra-rust", version, about = "Binary analysis tool powered by ghidra-rust")]
@@ -47,6 +49,32 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
+    /// Run full analysis on a binary
+    Analyze {
+        /// Path to the binary file
+        file: PathBuf,
+    },
+    /// List discovered functions
+    Functions {
+        /// Path to the binary file
+        file: PathBuf,
+    },
+    /// Show cross-references to/from an address
+    Xrefs {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Target address (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+    },
+    /// Show call graph
+    Callgraph {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Output DOT format
+        #[arg(long)]
+        dot: bool,
+    },
     /// Hex dump at a given address
     Hexdump {
         /// Path to the binary file
@@ -85,6 +113,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             count,
         } => cmd_disasm(&file, start, count),
         Commands::Registers { file } => cmd_registers(&file),
+        Commands::Analyze { file } => cmd_analyze(&file),
+        Commands::Functions { file } => cmd_functions(&file),
+        Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
+        Commands::Callgraph { file, dot } => cmd_callgraph(&file, dot),
         Commands::Hexdump {
             file,
             address,
@@ -297,5 +329,120 @@ fn cmd_registers(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         println!("Default calling convention: {}", cc.name);
     }
 
+    Ok(())
+}
+
+fn analyze_binary(path: &Path) -> Result<Program, Box<dyn std::error::Error>> {
+    let mut program = Program::from_binary(path)?;
+    let manager = AnalysisManager::new();
+    let results = manager.run_all(&mut program)?;
+    for r in &results {
+        eprintln!(
+            "[{}] {} functions, {} refs, {} instructions",
+            r.analyzer_name, r.functions_found, r.references_found, r.instructions_decoded
+        );
+    }
+    Ok(program)
+}
+
+fn cmd_analyze(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+    println!("\nAnalysis complete: {}", path.display());
+    println!("  Functions:    {}", program.listing.function_count());
+    println!("  Instructions: {}", program.listing.instruction_count());
+    println!("  References:   {}", program.references.len());
+    println!("  Symbols:      {}", program.symbol_table.len());
+    Ok(())
+}
+
+fn cmd_functions(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+    println!(
+        "\n{:<18} {:<40} {:>8}",
+        "Address", "Name", "Blocks"
+    );
+    println!("{}", "-".repeat(70));
+    for func in program.listing.functions() {
+        println!(
+            "0x{:016x} {:<40} {:>8}",
+            func.entry_point,
+            func.name,
+            func.body.len(),
+        );
+    }
+    println!("\nTotal: {} functions", program.listing.function_count());
+    Ok(())
+}
+
+fn cmd_xrefs(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    let refs_to = program.references.get_refs_to(address);
+    let refs_from = program.references.get_refs_from(address);
+
+    if let Some(sym) = program.symbol_table.primary_at(address) {
+        println!("Cross-references for {} (0x{:x}):\n", sym.name, address);
+    } else {
+        println!("Cross-references for 0x{:x}:\n", address);
+    }
+
+    if refs_to.is_empty() {
+        println!("  References TO: (none)");
+    } else {
+        println!("  References TO ({}):", refs_to.len());
+        for r in refs_to {
+            let from_name = program
+                .symbol_table
+                .primary_at(r.from)
+                .map(|s| s.name.as_str())
+                .or_else(|| {
+                    program.listing.function_containing(r.from).map(|f| f.name.as_str())
+                })
+                .unwrap_or("???");
+            println!("    0x{:x} [{}] from {}", r.from, r.ref_type, from_name);
+        }
+    }
+
+    println!();
+
+    if refs_from.is_empty() {
+        println!("  References FROM: (none)");
+    } else {
+        println!("  References FROM ({}):", refs_from.len());
+        for r in refs_from {
+            let to_name = program
+                .symbol_table
+                .primary_at(r.to)
+                .map(|s| s.name.as_str())
+                .unwrap_or("???");
+            println!("    0x{:x} [{}] to {}", r.to, r.ref_type, to_name);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_callgraph(path: &Path, dot: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+    let cg = CallGraph::build(&program);
+
+    if dot {
+        print!("{}", cg.to_dot());
+    } else {
+        println!(
+            "Call graph: {} nodes, {} edges\n",
+            cg.node_count(),
+            cg.edge_count()
+        );
+        for func in program.listing.functions() {
+            let callees = cg.callees_of(func.entry_point);
+            if callees.is_empty() {
+                continue;
+            }
+            println!("  {} (0x{:x}):", func.name, func.entry_point);
+            for callee in &callees {
+                println!("    -> {} (0x{:x})", callee.name, callee.address);
+            }
+        }
+    }
     Ok(())
 }
