@@ -20,6 +20,8 @@ pub struct ProjectSummary {
     pub dwarf_functions: usize,
     pub analyzers_run: Vec<String>,
     pub version: String,
+    pub dynamic_libs: Vec<String>,
+    pub import_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +98,8 @@ impl ProjectSummary {
             dwarf_functions: program.dwarf_function_count(),
             analyzers_run: Vec::new(),
             version: "0.1.0".into(),
+            dynamic_libs: program.info.dynamic.needed_libs.clone(),
+            import_count: program.info.imports.len(),
         }
     }
 
@@ -166,6 +170,8 @@ mod tests {
             dwarf_functions: 0,
             analyzers_run: vec!["FunctionDiscovery".into()],
             version: "0.1.0".into(),
+            dynamic_libs: vec!["libc.so.6".into()],
+            import_count: 5,
         };
 
         let json = serde_json::to_string_pretty(&summary).unwrap();

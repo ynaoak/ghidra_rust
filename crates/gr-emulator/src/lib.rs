@@ -3,6 +3,7 @@ pub mod debugger;
 pub mod emulator;
 pub mod hooks;
 pub mod session;
+pub mod snapshot;
 pub mod state;
 pub mod trace;
 
