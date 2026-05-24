@@ -125,6 +125,9 @@ enum Commands {
         /// Max steps to execute
         #[arg(short = 'n', long, default_value = "100")]
         steps: u64,
+        /// Breakpoint addresses (hex, can specify multiple)
+        #[arg(short = 'b', long = "break", value_parser = parse_hex)]
+        breakpoints: Vec<u64>,
     },
     /// Hex dump at a given address
     Hexdump {
@@ -176,7 +179,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Decompile { file, address, ssa } => cmd_decompile(&file, address, ssa),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
         Commands::ExportXml { file, output } => cmd_export_xml(&file, output.as_deref()),
-        Commands::Emulate { file, start, steps } => cmd_emulate(&file, start, steps),
+        Commands::Emulate { file, start, steps, breakpoints } => cmd_emulate(&file, start, steps, &breakpoints),
         Commands::Hexdump {
             file,
             address,
@@ -621,7 +624,7 @@ fn cmd_export_xml(path: &Path, output: Option<&Path>) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u64]) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
 
     let is_64 = info.bits == 64;
@@ -637,6 +640,12 @@ fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64) -> Result<(), Bo
 
     let entry = start.unwrap_or(info.entry_point);
     let mut emu = gr_emulator::Emulator::new();
+    let mut bp_mgr = gr_emulator::BreakpointManager::new();
+
+    for &bp_addr in breakpoints {
+        let id = bp_mgr.add(bp_addr);
+        eprintln!("Breakpoint {} at 0x{:x}", id, bp_addr);
+    }
 
     for block in info.memory.blocks() {
         if let Some(data) = &block.data {
@@ -652,6 +661,10 @@ fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64) -> Result<(), Bo
     let mut total_steps = 0u64;
 
     while total_steps < max_steps {
+        if bp_mgr.check(addr) {
+            println!("  ** Breakpoint hit at 0x{:x} **", addr);
+            break;
+        }
         let lifted = match lifter.lift_instruction(&info.memory, addr) {
             Ok(l) => l,
             Err(e) => { println!("  [0x{:x}] decode error: {}", addr, e); break; }

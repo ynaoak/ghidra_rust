@@ -3,6 +3,7 @@ pub mod assembler;
 pub mod cspec;
 pub mod error;
 pub mod pspec;
+pub mod regmap;
 
 #[cfg(feature = "arm")]
 pub mod arm;

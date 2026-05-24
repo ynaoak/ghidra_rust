@@ -13,10 +13,20 @@ pub struct ProjectSummary {
     pub entry_point: u64,
     pub functions: Vec<FunctionSummary>,
     pub symbols: Vec<SymbolSummary>,
+    pub references: Vec<ReferenceSummary>,
     pub references_count: usize,
     pub instructions_count: usize,
     pub has_dwarf: bool,
     pub dwarf_functions: usize,
+    pub analyzers_run: Vec<String>,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceSummary {
+    pub from: u64,
+    pub to: u64,
+    pub ref_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +70,17 @@ impl ProjectSummary {
             })
             .collect();
 
+        let references = program
+            .references
+            .all_refs()
+            .take(5000)
+            .map(|r| ReferenceSummary {
+                from: r.from,
+                to: r.to,
+                ref_type: format!("{}", r.ref_type),
+            })
+            .collect();
+
         Self {
             name: program.name.clone(),
             format: format!("{}", program.info.format),
@@ -68,10 +89,13 @@ impl ProjectSummary {
             entry_point: program.entry_point(),
             functions,
             symbols,
+            references,
             references_count: program.references.len(),
             instructions_count: program.listing.instruction_count(),
             has_dwarf: program.has_dwarf(),
             dwarf_functions: program.dwarf_function_count(),
+            analyzers_run: Vec::new(),
+            version: "0.1.0".into(),
         }
     }
 
@@ -131,10 +155,17 @@ mod tests {
                 name: "printf".into(),
                 kind: "ExternalFunction".into(),
             }],
+            references: vec![ReferenceSummary {
+                from: 0x1000,
+                to: 0x2000,
+                ref_type: "CALL".into(),
+            }],
             references_count: 42,
             instructions_count: 100,
             has_dwarf: false,
             dwarf_functions: 0,
+            analyzers_run: vec!["FunctionDiscovery".into()],
+            version: "0.1.0".into(),
         };
 
         let json = serde_json::to_string_pretty(&summary).unwrap();

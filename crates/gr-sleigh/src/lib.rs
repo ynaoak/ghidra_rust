@@ -1,7 +1,9 @@
-pub mod packed;
-pub mod symbol;
 pub mod decision;
+pub mod packed;
+pub mod sla;
+pub mod symbol;
 
-pub use packed::PackedReader;
-pub use symbol::{SleighSymbol, SymbolTable, Constructor};
 pub use decision::DecisionNode;
+pub use packed::PackedReader;
+pub use sla::{SlaHeader, find_sla_files};
+pub use symbol::{Constructor, SleighSymbol, SymbolTable};
