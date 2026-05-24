@@ -269,6 +269,12 @@ impl BinaryLoader {
                         size: plt_entry_size,
                         kind: SymbolKind::Function,
                     });
+                    symbols.push(LoadSymbol {
+                        name: format!("{}@GOT", name),
+                        address: got_addr,
+                        size: if bits == 64 { 8 } else { 4 },
+                        kind: SymbolKind::Data,
+                    });
                 }
             }
         }

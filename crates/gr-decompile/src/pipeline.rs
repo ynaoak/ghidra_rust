@@ -38,8 +38,9 @@ pub fn decompile(
     }
 
     let terminated = trim_to_return(&lifted);
-    let empty_symbols = std::collections::BTreeMap::new();
-    build_decompile_result(&terminated, func_name, entry, &empty_symbols)
+    let empty_u64: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    let empty_i64: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
+    build_decompile_result(&terminated, func_name, entry, &empty_u64, &empty_u64, &empty_i64)
 }
 
 pub fn decompile_function(
@@ -81,7 +82,32 @@ pub fn decompile_function(
         .iter()
         .map(|s| (s.address, s.name.clone()))
         .collect();
-    build_decompile_result(&terminated, &func_name, func_entry, &symbols)
+
+    let mut string_literals = std::collections::BTreeMap::new();
+    for sym in program.symbol_table.iter() {
+        if sym.name.starts_with("s_") {
+            let lit = sym.name
+                .strip_prefix("s_")
+                .and_then(|s| s.rsplit_once('_'))
+                .map(|(text, _)| text.replace('_', " "))
+                .unwrap_or_default();
+            if !lit.is_empty() {
+                string_literals.insert(sym.address, lit);
+            }
+        }
+    }
+
+    let stack_vars: std::collections::BTreeMap<i64, String> = func
+        .map(|f| {
+            f.stack_frame
+                .variables
+                .iter()
+                .map(|(offset, var)| (*offset, var.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    build_decompile_result(&terminated, &func_name, func_entry, &symbols, &string_literals, &stack_vars)
 }
 
 fn build_decompile_result(
@@ -89,6 +115,8 @@ fn build_decompile_result(
     func_name: &str,
     entry: u64,
     symbols: &std::collections::BTreeMap<u64, String>,
+    string_literals: &std::collections::BTreeMap<u64, String>,
+    stack_vars: &std::collections::BTreeMap<i64, String>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -106,6 +134,8 @@ fn build_decompile_result(
 
     let structured = structure_cfg(&ssa.cfg);
     let mut emitter = CEmitter::with_symbols(symbols.clone());
+    emitter.set_string_literals(string_literals.clone());
+    emitter.set_stack_vars(stack_vars.clone());
     let c_code = emitter.emit_function(&ssa, &structured);
 
     Ok(DecompileResult {

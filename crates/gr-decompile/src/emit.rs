@@ -8,6 +8,8 @@ pub struct CEmitter {
     indent: usize,
     output: String,
     symbol_names: std::collections::BTreeMap<u64, String>,
+    string_literals: std::collections::BTreeMap<u64, String>,
+    stack_var_names: std::collections::BTreeMap<i64, String>,
 }
 
 impl CEmitter {
@@ -16,6 +18,8 @@ impl CEmitter {
             indent: 0,
             output: String::new(),
             symbol_names: std::collections::BTreeMap::new(),
+            string_literals: std::collections::BTreeMap::new(),
+            stack_var_names: std::collections::BTreeMap::new(),
         }
     }
 
@@ -24,7 +28,17 @@ impl CEmitter {
             indent: 0,
             output: String::new(),
             symbol_names: symbols,
+            string_literals: std::collections::BTreeMap::new(),
+            stack_var_names: std::collections::BTreeMap::new(),
         }
+    }
+
+    pub fn set_string_literals(&mut self, strings: std::collections::BTreeMap<u64, String>) {
+        self.string_literals = strings;
+    }
+
+    pub fn set_stack_vars(&mut self, vars: std::collections::BTreeMap<i64, String>) {
+        self.stack_var_names = vars;
     }
 
     pub fn emit_function(
@@ -312,6 +326,14 @@ impl CEmitter {
             return "???".into();
         }
         let vn = &func.varnodes[op.inputs[idx] as usize];
+        if vn.data.space == SpaceId::CONST && vn.data.offset > 0x1000 {
+            if let Some(s) = self.string_literals.get(&vn.data.offset) {
+                return format!("\"{}\"", s.escape_default());
+            }
+            if let Some(name) = self.symbol_names.get(&vn.data.offset) {
+                return name.clone();
+            }
+        }
         varnode_name(vn)
     }
 

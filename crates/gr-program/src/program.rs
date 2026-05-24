@@ -57,6 +57,20 @@ impl Program {
             ));
         }
 
+        for dwarf_func in &info.dwarf.functions {
+            if dwarf_func.low_pc == 0 {
+                continue;
+            }
+            if symbol_table.primary_at(dwarf_func.low_pc).is_none() {
+                symbol_table.add(Symbol::new(
+                    dwarf_func.name.clone(),
+                    dwarf_func.low_pc,
+                    SymbolType::Function,
+                    SourceType::Imported,
+                ));
+            }
+        }
+
         Ok(Self {
             name: path
                 .file_name()
@@ -89,6 +103,20 @@ impl Program {
                     .get_function(address)
                     .map(|f| f.name.clone())
             })
+            .or_else(|| {
+                self.info
+                    .dwarf
+                    .function_at(address)
+                    .map(|f| f.name.clone())
+            })
             .unwrap_or_else(|| format!("FUN_{:x}", address))
+    }
+
+    pub fn has_dwarf(&self) -> bool {
+        !self.info.dwarf.is_empty()
+    }
+
+    pub fn dwarf_function_count(&self) -> usize {
+        self.info.dwarf.functions.len()
     }
 }

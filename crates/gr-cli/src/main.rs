@@ -6,7 +6,7 @@ use gr_arch::arch::create_architecture;
 use gr_lift::x86::X86Lifter;
 use gr_lift::PcodeLift;
 use gr_loader::{BinaryLoader, SymbolKind};
-use gr_program::Program;
+use gr_program::{Program, ProjectSummary};
 
 #[derive(Parser)]
 #[command(name = "ghidra-rust", version, about = "Binary analysis tool powered by ghidra-rust")]
@@ -99,6 +99,14 @@ enum Commands {
         #[arg(long)]
         ssa: bool,
     },
+    /// Export analysis results to JSON
+    Export {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Output JSON file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Hex dump at a given address
     Hexdump {
         /// Path to the binary file
@@ -147,6 +155,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             count,
         } => cmd_pcode(&file, start, count),
         Commands::Decompile { file, address, ssa } => cmd_decompile(&file, address, ssa),
+        Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
         Commands::Hexdump {
             file,
             address,
@@ -548,5 +557,29 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool) -> Result<()
         result.stats.live_ops_after,
         result.stats.optimization,
     );
+    Ok(())
+}
+
+fn cmd_export(path: &Path, output: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+    let summary = ProjectSummary::from_program(&program);
+
+    let out_path = output
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| {
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            PathBuf::from(format!("{}.grp.json", stem))
+        });
+
+    summary.save_to_file(&out_path)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    println!("Exported to: {}", out_path.display());
+    println!("  Functions:  {}", summary.functions.len());
+    println!("  Symbols:    {}", summary.symbols.len());
+    println!("  References: {}", summary.references_count);
+    if summary.has_dwarf {
+        println!("  DWARF:      {} functions", summary.dwarf_functions);
+    }
     Ok(())
 }

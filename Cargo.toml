@@ -41,3 +41,5 @@ gimli = "0.31"
 object = { version = "0.36", default-features = false, features = ["read", "std"] }
 cpp_demangle = "0.4"
 rustc-demangle = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

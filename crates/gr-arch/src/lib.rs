@@ -4,6 +4,8 @@ pub mod error;
 
 #[cfg(feature = "arm")]
 pub mod arm;
+#[cfg(feature = "arm")]
+pub mod riscv;
 #[cfg(feature = "x86")]
 pub mod x86;
 

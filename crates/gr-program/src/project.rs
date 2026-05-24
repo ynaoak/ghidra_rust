@@ -1,0 +1,127 @@
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::Program;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub name: String,
+    pub format: String,
+    pub arch: String,
+    pub bits: u32,
+    pub entry_point: u64,
+    pub functions: Vec<FunctionSummary>,
+    pub symbols: Vec<SymbolSummary>,
+    pub references_count: usize,
+    pub instructions_count: usize,
+    pub has_dwarf: bool,
+    pub dwarf_functions: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FunctionSummary {
+    pub address: u64,
+    pub name: String,
+    pub block_count: usize,
+    pub call_count: usize,
+    pub stack_size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SymbolSummary {
+    pub address: u64,
+    pub name: String,
+    pub kind: String,
+}
+
+impl ProjectSummary {
+    pub fn from_program(program: &Program) -> Self {
+        let functions = program
+            .listing
+            .functions()
+            .map(|f| FunctionSummary {
+                address: f.entry_point,
+                name: f.name.clone(),
+                block_count: f.body.len(),
+                call_count: f.call_targets.len(),
+                stack_size: f.stack_frame.local_size,
+            })
+            .collect();
+
+        let symbols = program
+            .symbol_table
+            .iter()
+            .take(10000)
+            .map(|s| SymbolSummary {
+                address: s.address,
+                name: s.name.clone(),
+                kind: format!("{:?}", s.symbol_type),
+            })
+            .collect();
+
+        Self {
+            name: program.name.clone(),
+            format: format!("{}", program.info.format),
+            arch: format!("{}", program.info.arch),
+            bits: program.info.bits,
+            entry_point: program.entry_point(),
+            functions,
+            symbols,
+            references_count: program.references.len(),
+            instructions_count: program.listing.instruction_count(),
+            has_dwarf: program.has_dwarf(),
+            dwarf_functions: program.dwarf_function_count(),
+        }
+    }
+
+    pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("serialize: {}", e))?;
+        std::fs::write(path, json).map_err(|e| format!("write: {}", e))
+    }
+
+    pub fn load_from_file(path: &Path) -> Result<Self, String> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| format!("read: {}", e))?;
+        serde_json::from_str(&json).map_err(|e| format!("deserialize: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_summary() {
+        let summary = ProjectSummary {
+            name: "test.exe".into(),
+            format: "PE".into(),
+            arch: "x86_64".into(),
+            bits: 64,
+            entry_point: 0x1000,
+            functions: vec![FunctionSummary {
+                address: 0x1000,
+                name: "main".into(),
+                block_count: 3,
+                call_count: 2,
+                stack_size: 0x28,
+            }],
+            symbols: vec![SymbolSummary {
+                address: 0x2000,
+                name: "printf".into(),
+                kind: "ExternalFunction".into(),
+            }],
+            references_count: 42,
+            instructions_count: 100,
+            has_dwarf: false,
+            dwarf_functions: 0,
+        };
+
+        let json = serde_json::to_string_pretty(&summary).unwrap();
+        let loaded: ProjectSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.name, "test.exe");
+        assert_eq!(loaded.functions.len(), 1);
+        assert_eq!(loaded.functions[0].name, "main");
+    }
+}

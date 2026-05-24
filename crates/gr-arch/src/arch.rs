@@ -173,6 +173,10 @@ pub fn create_architecture(
         gr_loader::Architecture::Arm => Ok(Box::new(crate::arm::ArmArch::new_arm32())),
         #[cfg(feature = "arm")]
         gr_loader::Architecture::Arm64 => Ok(Box::new(crate::arm::ArmArch::new_aarch64())),
+        #[cfg(feature = "arm")]
+        gr_loader::Architecture::Riscv32 => Ok(Box::new(crate::riscv::RiscVArch::new_rv32())),
+        #[cfg(feature = "arm")]
+        gr_loader::Architecture::Riscv64 => Ok(Box::new(crate::riscv::RiscVArch::new_rv64())),
         other => Err(DisasmError::UnsupportedArch(format!("{}", other))),
     }
 }
