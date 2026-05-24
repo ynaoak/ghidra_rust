@@ -1,4 +1,4 @@
-/// FLIRT (Fast Library Identification and Recognition Technology) pattern matching.
+// FLIRT (Fast Library Identification and Recognition Technology) pattern matching.
 
 #[derive(Debug, Clone)]
 pub struct FlirtPattern {

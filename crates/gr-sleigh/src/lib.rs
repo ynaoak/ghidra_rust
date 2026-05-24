@@ -5,6 +5,7 @@ pub mod instruction;
 pub mod space_manager;
 pub mod packed;
 pub mod pcode_template;
+pub mod pattern;
 pub mod sla;
 pub mod symbol;
 pub mod token;

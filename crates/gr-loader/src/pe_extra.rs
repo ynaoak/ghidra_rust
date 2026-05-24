@@ -1,4 +1,4 @@
-/// PE format extra features: exception tables, TLS, rich header.
+// PE format extra features: exception tables, TLS, rich header.
 
 #[derive(Debug, Clone)]
 pub struct ExceptionEntry {

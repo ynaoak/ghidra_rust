@@ -2,6 +2,7 @@ pub mod breakpoint;
 pub mod debugger;
 pub mod emulator;
 pub mod hooks;
+pub mod process;
 pub mod session;
 pub mod snapshot;
 pub mod state;

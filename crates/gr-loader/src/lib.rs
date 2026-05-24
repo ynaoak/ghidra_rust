@@ -6,6 +6,7 @@ pub mod flirt;
 pub mod pdb;
 pub mod pe_extra;
 pub mod relocations;
+pub mod source_map;
 pub mod symbols;
 
 pub use error::LoaderError;
