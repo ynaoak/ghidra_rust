@@ -9,6 +9,7 @@ pub mod pattern;
 pub mod sla;
 pub mod symbol;
 pub mod token;
+pub mod userops;
 
 pub use decision::DecisionNode;
 pub use packed::PackedReader;

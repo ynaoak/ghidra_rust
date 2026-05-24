@@ -5,6 +5,7 @@ pub mod dominator;
 pub mod emit;
 pub mod optimize;
 pub mod pipeline;
+pub mod scope;
 pub mod ssa;
 pub mod structure;
 pub mod token;

@@ -3,6 +3,8 @@ pub mod error;
 pub mod loader;
 pub mod memory;
 pub mod flirt;
+pub mod hash;
+pub mod imports;
 pub mod pdb;
 pub mod pe_extra;
 pub mod relocations;
