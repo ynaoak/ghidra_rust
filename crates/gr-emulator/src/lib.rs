@@ -3,6 +3,7 @@ pub mod debugger;
 pub mod emulator;
 pub mod hooks;
 pub mod memory_model;
+pub mod network;
 pub mod process;
 pub mod session;
 pub mod snapshot;

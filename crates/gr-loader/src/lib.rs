@@ -8,6 +8,7 @@ pub mod flirt;
 pub mod hash;
 pub mod imports;
 pub mod pdb;
+pub mod pdb_types;
 pub mod pe_extra;
 pub mod relocations;
 pub mod source_map;

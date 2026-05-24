@@ -1,6 +1,7 @@
 pub mod compiler;
 pub mod context;
 pub mod decision;
+pub mod decode;
 pub mod disasm;
 pub mod display;
 pub mod instruction;
