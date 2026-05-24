@@ -8,8 +8,8 @@ use crate::arch::{
 };
 use crate::error::DisasmError;
 
-const REGISTER_SPACE: SpaceId = SpaceId(2);
-const RAM_SPACE: SpaceId = SpaceId(1);
+const REGISTER_SPACE: SpaceId = SpaceId::REGISTER;
+const RAM_SPACE: SpaceId = SpaceId::RAM;
 
 fn x64_registers() -> Vec<RegisterInfo> {
     let mut regs = Vec::new();

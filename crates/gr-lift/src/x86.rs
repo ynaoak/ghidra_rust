@@ -6,10 +6,10 @@ use smallvec::SmallVec;
 
 use crate::lift::{LiftError, LiftedInstruction, PcodeLift};
 
-const CONST_SPACE: SpaceId = SpaceId(0);
-const RAM_SPACE: SpaceId = SpaceId(1);
-const REG_SPACE: SpaceId = SpaceId(2);
-const UNIQUE_SPACE: SpaceId = SpaceId(3);
+const CONST_SPACE: SpaceId = SpaceId::CONST;
+const RAM_SPACE: SpaceId = SpaceId::RAM;
+const REG_SPACE: SpaceId = SpaceId::REGISTER;
+const UNIQUE_SPACE: SpaceId = SpaceId::UNIQUE;
 
 const ZF_OFFSET: u64 = 0x206;
 const SF_OFFSET: u64 = 0x207;

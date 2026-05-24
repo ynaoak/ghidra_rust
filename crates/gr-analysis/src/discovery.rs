@@ -144,7 +144,7 @@ fn disassemble_function(
 
             global_visited.insert(insn_addr);
             body.add(AddressRange::new(
-                Address::new(SpaceId(1), insn_addr),
+                Address::new(SpaceId::RAM, insn_addr),
                 insn_len,
             ));
             instruction_count += 1;

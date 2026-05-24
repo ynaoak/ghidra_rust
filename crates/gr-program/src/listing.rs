@@ -72,6 +72,6 @@ impl Listing {
             .range(..=address)
             .next_back()
             .map(|(_, f)| f)
-            .filter(|f| f.body.contains(&gr_core::address::Address::new(gr_core::address::SpaceId(1), address)))
+            .filter(|f| f.body.contains(&gr_core::address::Address::new(gr_core::address::SpaceId::RAM, address)))
     }
 }

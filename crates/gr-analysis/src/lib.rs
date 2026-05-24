@@ -3,6 +3,7 @@ pub mod callgraph;
 pub mod discovery;
 pub mod manager;
 pub mod references;
+pub mod stack;
 pub mod strings;
 
 pub use analyzer::Analyzer;

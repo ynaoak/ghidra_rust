@@ -54,7 +54,7 @@ impl EmulatorState {
     }
 
     pub fn read_varnode(&self, vn: &VarnodeData) -> u64 {
-        if vn.space == SpaceId(0) {
+        if vn.space == SpaceId::CONST {
             return vn.offset;
         }
         self.get_space(vn.space)
@@ -72,19 +72,19 @@ impl EmulatorState {
     }
 
     pub fn read_register(&self, offset: u64, size: u32) -> u64 {
-        self.read_varnode(&VarnodeData::new(SpaceId(2), offset, size))
+        self.read_varnode(&VarnodeData::new(SpaceId::REGISTER, offset, size))
     }
 
     pub fn write_register(&mut self, offset: u64, size: u32, value: u64) {
-        self.write_varnode(&VarnodeData::new(SpaceId(2), offset, size), value);
+        self.write_varnode(&VarnodeData::new(SpaceId::REGISTER, offset, size), value);
     }
 
     pub fn read_memory(&self, address: u64, size: u32) -> u64 {
-        self.read_varnode(&VarnodeData::new(SpaceId(1), address, size))
+        self.read_varnode(&VarnodeData::new(SpaceId::RAM, address, size))
     }
 
     pub fn write_memory(&mut self, address: u64, size: u32, value: u64) {
-        self.write_varnode(&VarnodeData::new(SpaceId(1), address, size), value);
+        self.write_varnode(&VarnodeData::new(SpaceId::RAM, address, size), value);
     }
 
     pub fn load_memory_bytes(&mut self, address: u64, data: &[u8]) {

@@ -5,19 +5,20 @@ use gr_core::pcode::{OpCode, VarnodeData};
 use crate::cfg::{BlockId, ControlFlowGraph};
 
 pub type VarId = u32;
+pub type OpIdx = usize;
 
 #[derive(Debug, Clone)]
 pub struct SsaVarnode {
     pub id: VarId,
     pub data: VarnodeData,
     pub version: u32,
-    pub def_op: Option<usize>,
-    pub uses: Vec<usize>,
+    pub def_op: Option<OpIdx>,
+    pub uses: Vec<OpIdx>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SsaOp {
-    pub index: usize,
+    pub index: OpIdx,
     pub opcode: OpCode,
     pub output: Option<VarId>,
     pub inputs: Vec<VarId>,
@@ -100,7 +101,7 @@ impl SsaFunction {
 
     fn get_or_create_var(&mut self, vn: &VarnodeData) -> VarId {
         let key = (vn.space.0, vn.offset, vn.size);
-        if vn.space == gr_core::address::SpaceId(0) {
+        if vn.space == gr_core::address::SpaceId::CONST {
             let id = self.next_var_id;
             self.next_var_id += 1;
             self.varnodes.push(SsaVarnode {
@@ -180,7 +181,7 @@ impl SsaFunction {
             out.push_str(op.opcode.name());
             for (i, &inp_id) in op.inputs.iter().enumerate() {
                 let vn = &self.varnodes[inp_id as usize];
-                if vn.data.space == gr_core::address::SpaceId(0) {
+                if vn.data.space == gr_core::address::SpaceId::CONST {
                     out.push_str(&format!(
                         "{}0x{:x}",
                         if i == 0 { " " } else { ", " },

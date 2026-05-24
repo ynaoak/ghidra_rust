@@ -51,7 +51,7 @@ pub fn constant_fold(func: &mut SsaFunction) -> usize {
         let all_const = func.ops[i]
             .inputs
             .iter()
-            .all(|&id| func.varnodes[id as usize].data.space == gr_core::address::SpaceId(0));
+            .all(|&id| func.varnodes[id as usize].data.space == gr_core::address::SpaceId::CONST);
 
         if !all_const || func.ops[i].inputs.is_empty() {
             continue;
@@ -102,7 +102,7 @@ pub fn constant_fold(func: &mut SsaFunction) -> usize {
             let const_id = func.varnodes.len() as u32;
             func.varnodes.push(crate::ssa::SsaVarnode {
                 id: const_id,
-                data: gr_core::pcode::VarnodeData::new(gr_core::address::SpaceId(0), val, out_size),
+                data: gr_core::pcode::VarnodeData::new(gr_core::address::SpaceId::CONST, val, out_size),
                 version: 0,
                 def_op: None,
                 uses: vec![i],
@@ -130,7 +130,7 @@ pub fn copy_propagation(func: &mut SsaFunction) -> usize {
         let src_id = func.ops[i].inputs[0];
 
         let src_is_const =
-            func.varnodes[src_id as usize].data.space == gr_core::address::SpaceId(0);
+            func.varnodes[src_id as usize].data.space == gr_core::address::SpaceId::CONST;
         if !src_is_const {
             continue;
         }

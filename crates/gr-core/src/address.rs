@@ -39,6 +39,13 @@ bitflags::bitflags! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SpaceId(pub u32);
 
+impl SpaceId {
+    pub const CONST: SpaceId = SpaceId(0);
+    pub const RAM: SpaceId = SpaceId(1);
+    pub const REGISTER: SpaceId = SpaceId(2);
+    pub const UNIQUE: SpaceId = SpaceId(3);
+}
+
 #[derive(Debug, Clone)]
 pub struct AddressSpace {
     pub name: String,

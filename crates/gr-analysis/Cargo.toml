@@ -10,5 +10,6 @@ gr-core = { workspace = true }
 gr-loader = { workspace = true }
 gr-arch = { workspace = true }
 gr-program = { workspace = true }
+gr-lift = { workspace = true }
 thiserror = { workspace = true }
 petgraph = { workspace = true }

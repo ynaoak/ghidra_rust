@@ -47,7 +47,7 @@ impl CEmitter {
     fn emit_var_declarations(&mut self, func: &SsaFunction) {
         let mut declared = std::collections::BTreeSet::new();
         for vn in &func.varnodes {
-            if vn.data.space == SpaceId(2) && vn.def_op.is_some() {
+            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some() {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_type(vn.data.size);
@@ -344,7 +344,7 @@ fn infer_signature(func: &SsaFunction) -> FunctionSignature {
             return false;
         }
         let ret_vn = &func.varnodes[op.inputs[0] as usize];
-        ret_vn.data.space == SpaceId(2) && ret_vn.data.offset == 0x00
+        ret_vn.data.space == SpaceId::REGISTER && ret_vn.data.offset == 0x00
     });
 
     let return_type = if has_return_value { "uint64_t" } else { "void" };
@@ -359,7 +359,7 @@ fn infer_signature(func: &SsaFunction) -> FunctionSignature {
     let mut params = Vec::new();
     for &(offset, name) in param_regs {
         let is_input = func.varnodes.iter().any(|vn| {
-            vn.data.space == SpaceId(2)
+            vn.data.space == SpaceId::REGISTER
                 && vn.data.offset == offset
                 && vn.def_op.is_none()
                 && !vn.uses.is_empty()
@@ -376,16 +376,16 @@ fn infer_signature(func: &SsaFunction) -> FunctionSignature {
 }
 
 fn varnode_name(vn: &crate::ssa::SsaVarnode) -> String {
-    if vn.data.space == SpaceId(0) {
+    if vn.data.space == SpaceId::CONST {
         if vn.data.offset <= 9 {
             return format!("{}", vn.data.offset);
         }
         return format!("0x{:x}", vn.data.offset);
     }
-    if vn.data.space == SpaceId(2) {
+    if vn.data.space == SpaceId::REGISTER {
         return reg_name(vn.data.offset, vn.data.size);
     }
-    if vn.data.space == SpaceId(1) {
+    if vn.data.space == SpaceId::RAM {
         return format!("0x{:x}", vn.data.offset);
     }
     format!("tmp_{:x}", vn.data.offset)

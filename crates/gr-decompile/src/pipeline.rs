@@ -132,7 +132,7 @@ fn trim_to_function_body(
             .iter()
             .filter(|insn| {
                 body_addrs.contains(&gr_core::address::Address::new(
-                    gr_core::address::SpaceId(1),
+                    gr_core::address::SpaceId::RAM,
                     insn.address,
                 )) || insn.address == entry
             })

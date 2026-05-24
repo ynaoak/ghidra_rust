@@ -3,6 +3,7 @@ use gr_program::Program;
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 use crate::discovery::FunctionDiscoveryAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
+use crate::stack::StackFrameAnalyzer;
 use crate::strings::StringSearchAnalyzer;
 
 pub struct AnalysisManager {
@@ -22,6 +23,7 @@ impl AnalysisManager {
             Box::new(StringSearchAnalyzer),
             Box::new(NoReturnAnalyzer),
             Box::new(ScalarReferenceAnalyzer),
+            Box::new(StackFrameAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
         Self { analyzers }

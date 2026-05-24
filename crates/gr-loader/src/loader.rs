@@ -132,7 +132,7 @@ impl BinaryLoader {
         let bits = if elf.is_64 { 64 } else { 32 };
         let arch = Self::elf_arch(elf);
 
-        let ram_space = SpaceId(1);
+        let ram_space = SpaceId::RAM;
         let mut memory = Memory::new(ram_space, endian);
 
         let mut sections = Vec::new();
@@ -317,7 +317,7 @@ impl BinaryLoader {
         };
 
         let image_base = pe.image_base as u64;
-        let ram_space = SpaceId(1);
+        let ram_space = SpaceId::RAM;
         let mut memory = Memory::new(ram_space, Endian::Little);
 
         let mut sections = Vec::new();
@@ -441,7 +441,7 @@ impl BinaryLoader {
         let bits = if macho.is_64 { 64 } else { 32 };
         let arch = Self::mach_arch(macho);
 
-        let ram_space = SpaceId(1);
+        let ram_space = SpaceId::RAM;
         let mut memory = Memory::new(ram_space, endian);
 
         let mut sections = Vec::new();

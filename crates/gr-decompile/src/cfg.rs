@@ -85,7 +85,7 @@ impl ControlFlowGraph {
                 for op in &insn.ops {
                     if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
                         && let Some(target_vn) = op.inputs.first()
-                            && target_vn.space == gr_core::address::SpaceId(1) {
+                            && target_vn.space == gr_core::address::SpaceId::RAM {
                                 leaders.insert(target_vn.offset);
                             }
                 }
