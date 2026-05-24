@@ -1,3 +1,4 @@
+pub mod coff;
 pub mod dwarf;
 pub mod error;
 pub mod loader;

@@ -1,3 +1,4 @@
+pub mod compiler;
 pub mod context;
 pub mod decision;
 pub mod disasm;

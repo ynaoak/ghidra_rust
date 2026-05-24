@@ -1,6 +1,7 @@
 pub mod action;
 pub mod cfg;
 pub mod comments_gen;
+pub mod dataflow;
 pub mod dominator;
 pub mod emit;
 pub mod optimize;
