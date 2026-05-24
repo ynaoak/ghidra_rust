@@ -9,6 +9,7 @@ members = [
     "crates/gr-lift",
     "crates/gr-emulator",
     "crates/gr-decompile",
+    "crates/gr-sleigh",
     "crates/gr-cli",
 ]
 
@@ -27,6 +28,7 @@ gr-analysis = { path = "crates/gr-analysis" }
 gr-lift = { path = "crates/gr-lift" }
 gr-emulator = { path = "crates/gr-emulator" }
 gr-decompile = { path = "crates/gr-decompile" }
+gr-sleigh = { path = "crates/gr-sleigh" }
 goblin = "0.9"
 memmap2 = "0.9"
 clap = { version = "4", features = ["derive"] }

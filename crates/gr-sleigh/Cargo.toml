@@ -1,0 +1,10 @@
+[package]
+name = "gr-sleigh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SLEIGH specification runtime for ghidra-rust"
+
+[dependencies]
+gr-core = { workspace = true }
+thiserror = { workspace = true }

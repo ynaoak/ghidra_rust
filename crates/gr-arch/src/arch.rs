@@ -177,6 +177,14 @@ pub fn create_architecture(
         gr_loader::Architecture::Riscv32 => Ok(Box::new(crate::riscv::RiscVArch::new_rv32())),
         #[cfg(feature = "arm")]
         gr_loader::Architecture::Riscv64 => Ok(Box::new(crate::riscv::RiscVArch::new_rv64())),
+        #[cfg(feature = "arm")]
+        gr_loader::Architecture::Mips => Ok(Box::new(crate::mips::MipsArch::new(false, gr_core::address::Endian::Big))),
+        #[cfg(feature = "arm")]
+        gr_loader::Architecture::Mips64 => Ok(Box::new(crate::mips::MipsArch::new(true, gr_core::address::Endian::Big))),
+        #[cfg(feature = "arm")]
+        gr_loader::Architecture::PowerPc => Ok(Box::new(crate::ppc::PpcArch::new(false))),
+        #[cfg(feature = "arm")]
+        gr_loader::Architecture::PowerPc64 => Ok(Box::new(crate::ppc::PpcArch::new(true))),
         other => Err(DisasmError::UnsupportedArch(format!("{}", other))),
     }
 }

@@ -2,9 +2,14 @@ pub mod arch;
 pub mod assembler;
 pub mod cspec;
 pub mod error;
+pub mod pspec;
 
 #[cfg(feature = "arm")]
 pub mod arm;
+#[cfg(feature = "arm")]
+pub mod mips;
+#[cfg(feature = "arm")]
+pub mod ppc;
 #[cfg(feature = "arm")]
 pub mod riscv;
 #[cfg(feature = "x86")]
