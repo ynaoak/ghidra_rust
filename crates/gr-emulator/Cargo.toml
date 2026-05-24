@@ -9,3 +9,4 @@ description = "P-code emulator for ghidra-rust"
 gr-core = { workspace = true }
 thiserror = { workspace = true }
 smallvec = { workspace = true }
+bitflags = { workspace = true }
