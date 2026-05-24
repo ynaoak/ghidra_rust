@@ -14,6 +14,14 @@ pub enum StructuredBlock {
         then_body: Box<StructuredBlock>,
         else_body: Box<StructuredBlock>,
     },
+    WhileLoop {
+        condition_block: BlockId,
+        body: Box<StructuredBlock>,
+    },
+    DoWhileLoop {
+        body: Box<StructuredBlock>,
+        condition_block: BlockId,
+    },
     Loop {
         header: BlockId,
         body: Box<StructuredBlock>,

@@ -98,6 +98,34 @@ impl CEmitter {
                 self.indent -= 1;
                 self.line("}");
             }
+            StructuredBlock::WhileLoop {
+                condition_block,
+                body,
+            } => {
+                self.emit_basic_block_no_branch(func, *condition_block);
+                self.line(&format!(
+                    "while ({}) {{",
+                    self.get_branch_condition(func, *condition_block)
+                ));
+                self.indent += 1;
+                self.emit_block(func, body);
+                self.indent -= 1;
+                self.line("}");
+            }
+            StructuredBlock::DoWhileLoop {
+                body,
+                condition_block,
+            } => {
+                self.line("do {");
+                self.indent += 1;
+                self.emit_block(func, body);
+                self.emit_basic_block_no_branch(func, *condition_block);
+                self.indent -= 1;
+                self.line(&format!(
+                    "}} while ({});",
+                    self.get_branch_condition(func, *condition_block)
+                ));
+            }
             StructuredBlock::Loop { header, body } => {
                 self.line("while (true) {");
                 self.indent += 1;

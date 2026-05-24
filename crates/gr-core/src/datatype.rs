@@ -186,6 +186,125 @@ impl EnumType {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct UnionType {
+    pub base: DataType,
+    pub fields: Vec<StructField>,
+}
+
+impl UnionType {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            base: DataType::new(name, 0, MetaType::Union),
+            fields: Vec::new(),
+        }
+    }
+
+    pub fn add_field(&mut self, name: impl Into<String>, data_type: Arc<DataType>) {
+        let dt_size = data_type.size;
+        self.fields.push(StructField {
+            name: name.into(),
+            offset: 0,
+            data_type,
+        });
+        if dt_size > self.base.size {
+            self.base.size = dt_size;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PointerType {
+    pub base: DataType,
+    pub pointee: Arc<DataType>,
+}
+
+impl PointerType {
+    pub fn new(pointee: Arc<DataType>, ptr_size: usize) -> Self {
+        Self {
+            base: DataType::new(format!("{}*", pointee.name), ptr_size, MetaType::Ptr),
+            pointee,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ArrayType {
+    pub base: DataType,
+    pub element: Arc<DataType>,
+    pub count: usize,
+}
+
+impl ArrayType {
+    pub fn new(element: Arc<DataType>, count: usize) -> Self {
+        Self {
+            base: DataType::new(
+                format!("{}[{}]", element.name, count),
+                element.size * count,
+                MetaType::Array,
+            ),
+            element,
+            count,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TypedefType {
+    pub base: DataType,
+    pub target: Arc<DataType>,
+}
+
+impl TypedefType {
+    pub fn new(name: impl Into<String>, target: Arc<DataType>) -> Self {
+        let target_size = target.size;
+        Self {
+            base: DataType::new(name, target_size, target.meta),
+            target,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionPrototype {
+    pub name: String,
+    pub return_type: Arc<DataType>,
+    pub parameters: Vec<(String, Arc<DataType>)>,
+    pub is_variadic: bool,
+}
+
+impl FunctionPrototype {
+    pub fn new(name: impl Into<String>, return_type: Arc<DataType>) -> Self {
+        Self {
+            name: name.into(),
+            return_type,
+            parameters: Vec::new(),
+            is_variadic: false,
+        }
+    }
+
+    pub fn add_param(&mut self, name: impl Into<String>, typ: Arc<DataType>) {
+        self.parameters.push((name.into(), typ));
+    }
+
+    pub fn to_c_signature(&self) -> String {
+        let params = if self.parameters.is_empty() {
+            "void".to_string()
+        } else {
+            let mut parts: Vec<String> = self
+                .parameters
+                .iter()
+                .map(|(name, ty)| format!("{} {}", ty.name, name))
+                .collect();
+            if self.is_variadic {
+                parts.push("...".to_string());
+            }
+            parts.join(", ")
+        };
+        format!("{} {}({})", self.return_type.name, self.name, params)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct DataTypeManager {
     types: Vec<Arc<DataType>>,

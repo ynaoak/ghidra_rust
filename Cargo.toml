@@ -37,3 +37,7 @@ iced-x86 = { version = "1", default-features = false, features = ["std", "decode
 capstone = "0.13"
 petgraph = "0.7"
 quick-xml = "0.37"
+gimli = "0.31"
+object = { version = "0.36", default-features = false, features = ["read", "std"] }
+cpp_demangle = "0.4"
+rustc-demangle = "0.1"

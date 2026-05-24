@@ -4,6 +4,7 @@ use std::sync::Arc;
 use goblin::Object;
 use gr_core::address::Endian;
 
+use crate::dwarf::{self, DwarfInfo};
 use crate::error::LoaderError;
 use crate::memory::{Memory, MemoryBlock, MemoryFlags};
 use gr_core::address::SpaceId;
@@ -104,6 +105,7 @@ pub struct BinaryInfo {
     pub symbols: Vec<LoadSymbol>,
     pub imports: Vec<ImportEntry>,
     pub memory: Memory,
+    pub dwarf: DwarfInfo,
 }
 
 pub struct BinaryLoader;
@@ -115,12 +117,15 @@ impl BinaryLoader {
     }
 
     pub fn load_bytes(data: &[u8]) -> Result<BinaryInfo, LoaderError> {
-        match Object::parse(data).map_err(|e| LoaderError::Parse(e.to_string()))? {
+        let dwarf_info = dwarf::parse_dwarf(data).unwrap_or_default();
+        let mut info = match Object::parse(data).map_err(|e| LoaderError::Parse(e.to_string()))? {
             Object::Elf(elf) => Self::load_elf(&elf, data),
             Object::PE(pe) => Self::load_pe(&pe, data),
             Object::Mach(mach) => Self::load_mach(&mach, data),
             _ => Err(LoaderError::UnsupportedFormat),
-        }
+        }?;
+        info.dwarf = dwarf_info;
+        Ok(info)
     }
 
     fn load_elf(elf: &goblin::elf::Elf, data: &[u8]) -> Result<BinaryInfo, LoaderError> {
@@ -278,6 +283,7 @@ impl BinaryLoader {
             symbols,
             imports,
             memory,
+            dwarf: DwarfInfo::default(),
         })
     }
 
@@ -412,6 +418,7 @@ impl BinaryLoader {
             symbols,
             imports: Vec::new(),
             memory,
+            dwarf: DwarfInfo::default(),
         })
     }
 
@@ -529,6 +536,7 @@ impl BinaryLoader {
             symbols,
             imports: Vec::new(),
             memory,
+            dwarf: DwarfInfo::default(),
         })
     }
 

@@ -11,3 +11,5 @@ goblin = { workspace = true }
 memmap2 = { workspace = true }
 thiserror = { workspace = true }
 bitflags = { workspace = true }
+gimli = { workspace = true }
+object = { workspace = true }

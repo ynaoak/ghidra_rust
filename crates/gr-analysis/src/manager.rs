@@ -1,7 +1,9 @@
 use gr_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::demangle::DemangleAnalyzer;
 use crate::discovery::FunctionDiscoveryAnalyzer;
+use crate::propagation::ConstantPropagationAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
 use crate::strings::StringSearchAnalyzer;
@@ -19,10 +21,12 @@ impl Default for AnalysisManager {
 impl AnalysisManager {
     pub fn new() -> Self {
         let mut analyzers: Vec<Box<dyn Analyzer>> = vec![
+            Box::new(DemangleAnalyzer),
             Box::new(FunctionDiscoveryAnalyzer),
             Box::new(StringSearchAnalyzer),
             Box::new(NoReturnAnalyzer),
             Box::new(ScalarReferenceAnalyzer),
+            Box::new(ConstantPropagationAnalyzer),
             Box::new(StackFrameAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
