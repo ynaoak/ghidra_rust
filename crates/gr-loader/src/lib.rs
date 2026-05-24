@@ -2,7 +2,9 @@ pub mod dwarf;
 pub mod error;
 pub mod loader;
 pub mod memory;
+pub mod flirt;
 pub mod pdb;
+pub mod pe_extra;
 pub mod relocations;
 pub mod symbols;
 
