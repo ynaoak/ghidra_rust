@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod boundary;
+pub mod callingconv;
 pub mod callgraph;
 pub mod dataref;
 pub mod demangle;

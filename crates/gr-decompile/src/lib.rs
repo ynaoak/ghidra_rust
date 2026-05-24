@@ -8,6 +8,7 @@ pub mod ssa;
 pub mod structure;
 pub mod token;
 pub mod typeinfer;
+pub mod varrecovery;
 
 pub use pipeline::{decompile, decompile_function, DecompileResult, DecompileStats};
 pub use token::{Token, TokenDocument, TokenLine, TokenType};

@@ -2,6 +2,7 @@ use gr_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 use crate::boundary::{FunctionBoundaryAnalyzer, VariadicFunctionAnalyzer};
+use crate::callingconv::CallingConventionAnalyzer;
 use crate::dataref::DataReferenceAnalyzer;
 use crate::demangle::DemangleAnalyzer;
 use crate::discovery::FunctionDiscoveryAnalyzer;
@@ -53,6 +54,7 @@ impl AnalysisManager {
             Box::new(DuplicateCodeAnalyzer),
             Box::new(FunctionBoundaryAnalyzer),
             Box::new(VariadicFunctionAnalyzer),
+            Box::new(CallingConventionAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
         Self { analyzers }

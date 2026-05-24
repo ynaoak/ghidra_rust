@@ -3,6 +3,7 @@ pub mod error;
 pub mod loader;
 pub mod memory;
 pub mod pdb;
+pub mod relocations;
 
 pub use error::LoaderError;
 pub use dwarf::{DwarfInfo, DwarfFunctionInfo};
