@@ -1,6 +1,7 @@
 pub mod context;
 pub mod decision;
 pub mod disasm;
+pub mod display;
 pub mod instruction;
 pub mod space_manager;
 pub mod packed;

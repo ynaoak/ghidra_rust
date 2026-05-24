@@ -2,6 +2,7 @@ pub mod analyzer;
 pub mod boundary;
 pub mod callingconv;
 pub mod callgraph;
+pub mod coverage;
 pub mod dataref;
 pub mod demangle;
 pub mod discovery;

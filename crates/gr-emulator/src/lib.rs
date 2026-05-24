@@ -7,6 +7,7 @@ pub mod process;
 pub mod session;
 pub mod snapshot;
 pub mod state;
+pub mod syscall;
 pub mod watchpoint;
 pub mod trace;
 

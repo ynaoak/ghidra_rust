@@ -1,6 +1,7 @@
 pub mod comments;
 pub mod diff;
 pub mod export;
+pub mod history;
 pub mod undo;
 pub mod function;
 pub mod listing;
