@@ -187,11 +187,109 @@ impl Rule for RuleMultOne {
     }
 }
 
+pub struct RuleDoubleNeg;
+
+impl Rule for RuleDoubleNeg {
+    fn name(&self) -> &str { "DoubleNeg" }
+    fn apply_op(&self, func: &mut SsaFunction, op_idx: usize) -> bool {
+        let op = &func.ops[op_idx];
+        if op.opcode != OpCode::Int2Comp || op.inputs.len() != 1 {
+            return false;
+        }
+        let inner_id = op.inputs[0];
+        let inner_def = func.varnodes[inner_id as usize].def_op;
+        if let Some(def_idx) = inner_def
+            && func.ops[def_idx].opcode == OpCode::Int2Comp && func.ops[def_idx].inputs.len() == 1 {
+                let original = func.ops[def_idx].inputs[0];
+                func.ops[op_idx].opcode = OpCode::Copy;
+                func.ops[op_idx].inputs = vec![original];
+                return true;
+            }
+        false
+    }
+}
+
+pub struct RuleAndSelf;
+
+impl Rule for RuleAndSelf {
+    fn name(&self) -> &str { "AndSelf" }
+    fn apply_op(&self, func: &mut SsaFunction, op_idx: usize) -> bool {
+        let op = &func.ops[op_idx];
+        if op.opcode != OpCode::IntAnd || op.inputs.len() != 2 {
+            return false;
+        }
+        let a = op.inputs[0];
+        let b = op.inputs[1];
+        let vn_a = &func.varnodes[a as usize];
+        let vn_b = &func.varnodes[b as usize];
+        if vn_a.data.space == vn_b.data.space
+            && vn_a.data.offset == vn_b.data.offset
+            && vn_a.data.size == vn_b.data.size
+            && vn_a.data.space != SpaceId::CONST
+        {
+            func.ops[op_idx].opcode = OpCode::Copy;
+            func.ops[op_idx].inputs = vec![a];
+            return true;
+        }
+        false
+    }
+}
+
+pub struct RuleOrSelf;
+
+impl Rule for RuleOrSelf {
+    fn name(&self) -> &str { "OrSelf" }
+    fn apply_op(&self, func: &mut SsaFunction, op_idx: usize) -> bool {
+        let op = &func.ops[op_idx];
+        if op.opcode != OpCode::IntOr || op.inputs.len() != 2 {
+            return false;
+        }
+        let a = op.inputs[0];
+        let b = op.inputs[1];
+        let vn_a = &func.varnodes[a as usize];
+        let vn_b = &func.varnodes[b as usize];
+        if vn_a.data.space == vn_b.data.space
+            && vn_a.data.offset == vn_b.data.offset
+            && vn_a.data.size == vn_b.data.size
+            && vn_a.data.space != SpaceId::CONST
+        {
+            func.ops[op_idx].opcode = OpCode::Copy;
+            func.ops[op_idx].inputs = vec![a];
+            return true;
+        }
+        false
+    }
+}
+
+pub struct RuleShiftZero;
+
+impl Rule for RuleShiftZero {
+    fn name(&self) -> &str { "ShiftZero" }
+    fn apply_op(&self, func: &mut SsaFunction, op_idx: usize) -> bool {
+        let op = &func.ops[op_idx];
+        if !matches!(op.opcode, OpCode::IntLeft | OpCode::IntRight | OpCode::IntSRight) || op.inputs.len() != 2 {
+            return false;
+        }
+        let shift = &func.varnodes[op.inputs[1] as usize];
+        if shift.data.space == SpaceId::CONST && shift.data.offset == 0 {
+            let src = op.inputs[0];
+            func.ops[op_idx].opcode = OpCode::Copy;
+            func.ops[op_idx].inputs = vec![src];
+            return true;
+        }
+        false
+    }
+}
+
 pub fn create_default_rule_pool() -> RulePool {
     let mut pool = RulePool::new();
     pool.add(Box::new(RuleXorSelfZero));
     pool.add(Box::new(RuleAddZero));
     pool.add(Box::new(RuleMultOne));
+    pool.add(Box::new(RuleDoubleNeg));
+    pool.add(Box::new(RuleAndSelf));
+    pool.add(Box::new(RuleOrSelf));
+    pool.add(Box::new(RuleShiftZero));
     pool
 }
 
@@ -208,6 +306,6 @@ mod tests {
     #[test]
     fn rule_pool_default() {
         let pool = create_default_rule_pool();
-        assert_eq!(pool.rules.len(), 3);
+        assert_eq!(pool.rules.len(), 7);
     }
 }
