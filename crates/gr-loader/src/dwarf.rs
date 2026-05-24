@@ -165,6 +165,34 @@ pub fn parse_dwarf(data: &[u8]) -> Result<DwarfInfo, String> {
         });
     }
 
+    let mut line_units = dwarf.units();
+    while let Ok(Some(header)) = line_units.next() {
+        if let Ok(unit) = dwarf.unit(header)
+            && let Some(line_program) = unit.line_program.clone() {
+                let mut rows = line_program.rows();
+                while let Ok(Some((header, row))) = rows.next_row() {
+                    if row.end_sequence() {
+                        continue;
+                    }
+                    let file_name = row.file(header).and_then(|f| {
+                        let name = dwarf.attr_string(&unit, f.path_name()).ok()?;
+                        std::str::from_utf8(name.slice()).ok().map(|s| s.to_string())
+                    }).unwrap_or_default();
+
+                    info.line_table.push(DwarfLineEntry {
+                        address: row.address(),
+                        file: file_name,
+                        line: row.line().map(|l| l.get() as u32).unwrap_or(0),
+                        column: match row.column() {
+                            gimli::ColumnType::LeftEdge => 0,
+                            gimli::ColumnType::Column(c) => c.get() as u32,
+                        },
+                    });
+                }
+            }
+    }
+    info.line_table.sort_by_key(|e| e.address);
+
     Ok(info)
 }
 
