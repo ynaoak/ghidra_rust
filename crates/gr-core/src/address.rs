@@ -403,6 +403,116 @@ impl AddressSet {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SegmentedAddress {
+    pub segment: u16,
+    pub offset: u16,
+}
+
+impl SegmentedAddress {
+    pub fn new(segment: u16, offset: u16) -> Self {
+        Self { segment, offset }
+    }
+
+    pub fn to_linear(&self) -> u64 {
+        (self.segment as u64) * 16 + self.offset as u64
+    }
+
+    pub fn from_linear(linear: u64) -> Self {
+        Self {
+            segment: ((linear >> 4) & 0xFFFF) as u16,
+            offset: (linear & 0xF) as u16,
+        }
+    }
+
+    pub fn to_address(&self, space: SpaceId) -> Address {
+        Address::new(space, self.to_linear())
+    }
+}
+
+impl fmt::Display for SegmentedAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:04X}:{:04X}", self.segment, self.offset)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OverlayAddressSpace {
+    pub name: String,
+    pub base_space: SpaceId,
+    pub overlay_id: u32,
+    pub min_offset: u64,
+    pub max_offset: u64,
+}
+
+impl OverlayAddressSpace {
+    pub fn new(name: impl Into<String>, base_space: SpaceId, overlay_id: u32) -> Self {
+        Self {
+            name: name.into(),
+            base_space,
+            overlay_id,
+            min_offset: 0,
+            max_offset: u64::MAX,
+        }
+    }
+
+    pub fn translate_to_base(&self, addr: &Address) -> Address {
+        Address::new(self.base_space, addr.offset)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AddressMap {
+    entries: Vec<AddressMapEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct AddressMapEntry {
+    file_offset: u64,
+    virtual_address: u64,
+    size: u64,
+}
+
+impl AddressMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_mapping(&mut self, file_offset: u64, virtual_address: u64, size: u64) {
+        self.entries.push(AddressMapEntry {
+            file_offset,
+            virtual_address,
+            size,
+        });
+    }
+
+    pub fn file_to_virtual(&self, file_offset: u64) -> Option<u64> {
+        for entry in &self.entries {
+            if file_offset >= entry.file_offset
+                && file_offset < entry.file_offset + entry.size
+            {
+                return Some(
+                    entry.virtual_address + (file_offset - entry.file_offset),
+                );
+            }
+        }
+        None
+    }
+
+    pub fn virtual_to_file(&self, virtual_address: u64) -> Option<u64> {
+        for entry in &self.entries {
+            if virtual_address >= entry.virtual_address
+                && virtual_address < entry.virtual_address + entry.size
+            {
+                return Some(
+                    entry.file_offset + (virtual_address - entry.virtual_address),
+                );
+            }
+        }
+        None
+    }
+}
+
 pub fn read_u8(data: &[u8], offset: usize) -> Option<u8> {
     data.get(offset).copied()
 }

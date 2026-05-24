@@ -305,9 +305,84 @@ impl FunctionPrototype {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BitFieldDataType {
+    pub base: DataType,
+    pub bit_offset: u32,
+    pub bit_size: u32,
+    pub base_type: Arc<DataType>,
+}
+
+impl BitFieldDataType {
+    pub fn new(base_type: Arc<DataType>, bit_offset: u32, bit_size: u32) -> Self {
+        Self {
+            base: DataType::new(
+                format!("{}:{}", base_type.name, bit_size),
+                base_type.size,
+                base_type.meta,
+            ),
+            bit_offset,
+            bit_size,
+            base_type,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CategoryPath {
+    pub path: Vec<String>,
+}
+
+impl CategoryPath {
+    pub fn root() -> Self {
+        Self { path: Vec::new() }
+    }
+
+    pub fn new(path: impl Into<String>) -> Self {
+        let s: String = path.into();
+        Self {
+            path: s.split('/').filter(|p| !p.is_empty()).map(|p| p.to_string()).collect(),
+        }
+    }
+
+    pub fn child(&self, name: impl Into<String>) -> Self {
+        let mut p = self.path.clone();
+        p.push(name.into());
+        Self { path: p }
+    }
+
+    pub fn parent(&self) -> Option<Self> {
+        if self.path.is_empty() {
+            None
+        } else {
+            let mut p = self.path.clone();
+            p.pop();
+            Some(Self { path: p })
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        self.path.last().map(|s| s.as_str()).unwrap_or("/")
+    }
+}
+
+impl fmt::Display for CategoryPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "/{}", self.path.join("/"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+    ReplaceExisting,
+    KeepExisting,
+    RenamNew,
+}
+
 #[derive(Debug, Default)]
 pub struct DataTypeManager {
     types: Vec<Arc<DataType>>,
+    categories: std::collections::BTreeSet<String>,
 }
 
 impl DataTypeManager {
@@ -330,12 +405,58 @@ impl DataTypeManager {
         self.add(DataType::i64());
         self.add(DataType::f32());
         self.add(DataType::f64());
+        self.add(DataType::new("char", 1, MetaType::Int));
+        self.add(DataType::new("unsigned char", 1, MetaType::Uint));
+        self.add(DataType::new("short", 2, MetaType::Int));
+        self.add(DataType::new("unsigned short", 2, MetaType::Uint));
+        self.add(DataType::new("int", 4, MetaType::Int));
+        self.add(DataType::new("unsigned int", 4, MetaType::Uint));
+        self.add(DataType::new("long", 8, MetaType::Int));
+        self.add(DataType::new("unsigned long", 8, MetaType::Uint));
+        self.add(DataType::new("long long", 8, MetaType::Int));
+        self.add(DataType::new("unsigned long long", 8, MetaType::Uint));
+        self.add(DataType::new("size_t", 8, MetaType::Uint));
+        self.add(DataType::new("ssize_t", 8, MetaType::Int));
+        self.add(DataType::new("ptrdiff_t", 8, MetaType::Int));
+        self.add(DataType::new("intptr_t", 8, MetaType::Int));
+        self.add(DataType::new("uintptr_t", 8, MetaType::Uint));
+        self.add(DataType::new("wchar_t", 4, MetaType::Utf32));
+        self.add(DataType::new("char16_t", 2, MetaType::Utf16));
+        self.add(DataType::new("char32_t", 4, MetaType::Utf32));
+        self.add(DataType::new("long double", 16, MetaType::Float));
     }
 
     pub fn add(&mut self, dt: DataType) -> Arc<DataType> {
         let arc = Arc::new(dt);
         self.types.push(arc.clone());
         arc
+    }
+
+    pub fn add_with_category(&mut self, dt: DataType, category: &CategoryPath) -> Arc<DataType> {
+        self.categories.insert(category.to_string());
+        self.add(dt)
+    }
+
+    pub fn resolve(&mut self, dt: DataType, strategy: ConflictResolution) -> Arc<DataType> {
+        if let Some(existing) = self.find_by_name(&dt.name) {
+            match strategy {
+                ConflictResolution::KeepExisting => existing,
+                ConflictResolution::ReplaceExisting => {
+                    self.types.retain(|t| t.name != dt.name);
+                    self.add(dt)
+                }
+                ConflictResolution::RenamNew => {
+                    let renamed = DataType::new(
+                        format!("{}.conflict", dt.name),
+                        dt.size,
+                        dt.meta,
+                    );
+                    self.add(renamed)
+                }
+            }
+        } else {
+            self.add(dt)
+        }
     }
 
     pub fn find_by_name(&self, name: &str) -> Option<Arc<DataType>> {
@@ -351,6 +472,14 @@ impl DataTypeManager {
 
     pub fn types(&self) -> &[Arc<DataType>] {
         &self.types
+    }
+
+    pub fn type_count(&self) -> usize {
+        self.types.len()
+    }
+
+    pub fn categories(&self) -> &std::collections::BTreeSet<String> {
+        &self.categories
     }
 }
 
