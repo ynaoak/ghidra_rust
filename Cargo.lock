@@ -261,6 +261,8 @@ dependencies = [
  "gr-lift",
  "gr-loader",
  "gr-program",
+ "gr-sleigh",
+ "serde_json",
 ]
 
 [[package]]
