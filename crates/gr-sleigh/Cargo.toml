@@ -8,3 +8,4 @@ description = "SLEIGH specification runtime for ghidra-rust"
 [dependencies]
 gr-core = { workspace = true }
 thiserror = { workspace = true }
+flate2 = { workspace = true }

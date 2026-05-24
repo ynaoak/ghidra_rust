@@ -79,6 +79,41 @@ impl GdbConnection {
         self.rx_buffer.drain(..start + end + 3);
         Some(response)
     }
+    pub fn connect(&mut self) -> Result<(), std::io::Error> {
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        self.state = ConnectionState::Connecting;
+        match TcpStream::connect_timeout(
+            &self.config.address().parse().map_err(|_|
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid address"))?,
+            Duration::from_millis(self.config.timeout_ms),
+        ) {
+            Ok(_stream) => {
+                self.state = ConnectionState::Connected;
+                Ok(())
+            }
+            Err(e) => {
+                self.state = ConnectionState::Error;
+                Err(e)
+            }
+        }
+    }
+
+    pub fn send_command(&mut self, command: &crate::debugger::GdbCommand) -> Result<(), std::io::Error> {
+        if !self.is_connected() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected"));
+        }
+        let encoded = command.encode();
+        self.queue_send(&encoded);
+        Ok(())
+    }
+
+    pub fn disconnect(&mut self) {
+        self.state = ConnectionState::Disconnected;
+        self.rx_buffer.clear();
+        self.tx_buffer.clear();
+    }
 }
 
 #[cfg(test)]

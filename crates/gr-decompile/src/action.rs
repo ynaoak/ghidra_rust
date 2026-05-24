@@ -281,6 +281,65 @@ impl Rule for RuleShiftZero {
     }
 }
 
+pub struct RuleSubZero;
+impl Rule for RuleSubZero {
+    fn name(&self) -> &str { "SubZero" }
+    fn apply_op(&self, func: &mut SsaFunction, op_idx: usize) -> bool {
+        let op = &func.ops[op_idx];
+        if op.opcode != OpCode::IntSub || op.inputs.len() != 2 { return false; }
+        let b = &func.varnodes[op.inputs[1] as usize];
+        if b.data.space == SpaceId::CONST && b.data.offset == 0 {
+            let src = op.inputs[0];
+            func.ops[op_idx].opcode = OpCode::Copy;
+            func.ops[op_idx].inputs = vec![src];
+            return true;
+        }
+        false
+    }
+}
+
+pub struct RuleAndAllOnes;
+impl Rule for RuleAndAllOnes {
+    fn name(&self) -> &str { "AndAllOnes" }
+    fn apply_op(&self, func: &mut SsaFunction, op_idx: usize) -> bool {
+        let op = &func.ops[op_idx];
+        if op.opcode != OpCode::IntAnd || op.inputs.len() != 2 { return false; }
+        for i in 0..2 {
+            let inp = &func.varnodes[op.inputs[i] as usize];
+            if inp.data.space == SpaceId::CONST {
+                let size = func.ops[op_idx].output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                let all_ones = if size >= 8 { u64::MAX } else { (1u64 << (size * 8)) - 1 };
+                if inp.data.offset == all_ones {
+                    let other = op.inputs[1 - i];
+                    func.ops[op_idx].opcode = OpCode::Copy;
+                    func.ops[op_idx].inputs = vec![other];
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+pub struct RuleOrZero;
+impl Rule for RuleOrZero {
+    fn name(&self) -> &str { "OrZero" }
+    fn apply_op(&self, func: &mut SsaFunction, op_idx: usize) -> bool {
+        let op = &func.ops[op_idx];
+        if op.opcode != OpCode::IntOr || op.inputs.len() != 2 { return false; }
+        for i in 0..2 {
+            let inp = &func.varnodes[op.inputs[i] as usize];
+            if inp.data.space == SpaceId::CONST && inp.data.offset == 0 {
+                let other = op.inputs[1 - i];
+                func.ops[op_idx].opcode = OpCode::Copy;
+                func.ops[op_idx].inputs = vec![other];
+                return true;
+            }
+        }
+        false
+    }
+}
+
 pub fn create_default_rule_pool() -> RulePool {
     let mut pool = RulePool::new();
     pool.add(Box::new(RuleXorSelfZero));
@@ -290,6 +349,9 @@ pub fn create_default_rule_pool() -> RulePool {
     pool.add(Box::new(RuleAndSelf));
     pool.add(Box::new(RuleOrSelf));
     pool.add(Box::new(RuleShiftZero));
+    pool.add(Box::new(RuleSubZero));
+    pool.add(Box::new(RuleAndAllOnes));
+    pool.add(Box::new(RuleOrZero));
     pool
 }
 
@@ -306,6 +368,6 @@ mod tests {
     #[test]
     fn rule_pool_default() {
         let pool = create_default_rule_pool();
-        assert_eq!(pool.rules.len(), 7);
+        assert_eq!(pool.rules.len(), 10);
     }
 }

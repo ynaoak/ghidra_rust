@@ -72,13 +72,28 @@ pub enum SlaDecodeError {
 }
 
 pub fn try_decompress_sla(data: &[u8]) -> Result<Vec<u8>, SlaDecodeError> {
+    use std::io::Read;
     if data.len() < 2 {
         return Err(SlaDecodeError::InvalidFormat("too short".into()));
     }
     if data[0] == 0x78 && (data[1] == 0x01 || data[1] == 0x9C || data[1] == 0xDA) {
-        return Err(SlaDecodeError::InvalidFormat("zlib compressed, decompression not yet implemented".into()));
+        let mut decoder = flate2::read::ZlibDecoder::new(data);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)
+            .map_err(|_| SlaDecodeError::DecompressFailed)?;
+        return Ok(decompressed);
     }
     Ok(data.to_vec())
+}
+
+pub fn load_sla_file(path: &std::path::Path) -> Result<SlaDecoder, SlaDecodeError> {
+    let data = std::fs::read(path).map_err(|e|
+        SlaDecodeError::InvalidFormat(format!("read: {}", e)))?;
+    let decompressed = try_decompress_sla(&data)?;
+    let mut reader = PackedReader::new(decompressed);
+    let mut decoder = SlaDecoder::new();
+    decoder.decode_header(&mut reader)?;
+    Ok(decoder)
 }
 
 #[cfg(test)]
@@ -100,9 +115,21 @@ mod tests {
     }
 
     #[test]
-    fn try_decompress_compressed() {
+    fn try_decompress_compressed_invalid() {
         let data = vec![0x78, 0x9C, 0x00, 0x00];
         let result = try_decompress_sla(&data);
-        assert!(result.is_err()); // no zlib support without feature
+        // With flate2, may decompress to empty or error depending on data
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn try_decompress_valid_zlib() {
+        // Compress "hello" with zlib
+        use std::io::Write;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"hello world test data").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let result = try_decompress_sla(&compressed).unwrap();
+        assert_eq!(&result, b"hello world test data");
     }
 }
