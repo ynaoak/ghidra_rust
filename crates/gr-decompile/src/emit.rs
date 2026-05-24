@@ -140,6 +140,34 @@ impl CEmitter {
                     self.get_branch_condition(func, *condition_block)
                 ));
             }
+            StructuredBlock::Switch {
+                condition_block,
+                cases,
+                default,
+            } => {
+                self.emit_basic_block_no_branch(func, *condition_block);
+                self.line(&format!(
+                    "switch ({}) {{",
+                    self.get_branch_condition(func, *condition_block)
+                ));
+                self.indent += 1;
+                for (val, body) in cases {
+                    self.line(&format!("case 0x{:x}:", val));
+                    self.indent += 1;
+                    self.emit_block(func, body);
+                    self.line("break;");
+                    self.indent -= 1;
+                }
+                if let Some(def) = default {
+                    self.line("default:");
+                    self.indent += 1;
+                    self.emit_block(func, def);
+                    self.line("break;");
+                    self.indent -= 1;
+                }
+                self.indent -= 1;
+                self.line("}");
+            }
             StructuredBlock::Loop { header, body } => {
                 self.line("while (true) {");
                 self.indent += 1;

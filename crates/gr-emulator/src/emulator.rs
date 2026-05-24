@@ -72,15 +72,6 @@ impl Emulator {
                 self.state.write_varnode(out, a.wrapping_mul(b));
             }
 
-            OpCode::IntDiv => {
-                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_DIV".into()))?;
-                let a = self.read_input(op, 0)?;
-                let b = self.read_input(op, 1)?;
-                if b == 0 {
-                    return Err(EmulatorError::Halted(op.seq.addr.offset));
-                }
-                self.state.write_varnode(out, a / b);
-            }
 
             OpCode::IntAnd => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_AND".into()))?;
@@ -287,8 +278,203 @@ impl Emulator {
                 self.state.write_varnode(out, if (a != 0) ^ (b != 0) { 1 } else { 0 });
             }
 
-            _ => {
-                return Err(EmulatorError::Unsupported(op.opcode.name().into()));
+            OpCode::FloatAdd => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_ADD".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                let b = f64::from_bits(self.read_input(op, 1)?);
+                self.state.write_varnode(out, (a + b).to_bits());
+            }
+            OpCode::FloatSub => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_SUB".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                let b = f64::from_bits(self.read_input(op, 1)?);
+                self.state.write_varnode(out, (a - b).to_bits());
+            }
+            OpCode::FloatMult => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_MULT".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                let b = f64::from_bits(self.read_input(op, 1)?);
+                self.state.write_varnode(out, (a * b).to_bits());
+            }
+            OpCode::FloatDiv => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_DIV".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                let b = f64::from_bits(self.read_input(op, 1)?);
+                self.state.write_varnode(out, (a / b).to_bits());
+            }
+            OpCode::FloatNeg => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_NEG".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                self.state.write_varnode(out, (-a).to_bits());
+            }
+            OpCode::FloatAbs => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_ABS".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                self.state.write_varnode(out, a.abs().to_bits());
+            }
+            OpCode::FloatSqrt => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_SQRT".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                self.state.write_varnode(out, a.sqrt().to_bits());
+            }
+            OpCode::FloatEqual => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_EQUAL".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                let b = f64::from_bits(self.read_input(op, 1)?);
+                self.state.write_varnode(out, if a == b { 1 } else { 0 });
+            }
+            OpCode::FloatNotEqual => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_NOTEQUAL".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                let b = f64::from_bits(self.read_input(op, 1)?);
+                self.state.write_varnode(out, if a != b { 1 } else { 0 });
+            }
+            OpCode::FloatLess => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_LESS".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                let b = f64::from_bits(self.read_input(op, 1)?);
+                self.state.write_varnode(out, if a < b { 1 } else { 0 });
+            }
+            OpCode::FloatLessEqual => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_LESSEQUAL".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                let b = f64::from_bits(self.read_input(op, 1)?);
+                self.state.write_varnode(out, if a <= b { 1 } else { 0 });
+            }
+            OpCode::FloatNan => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_NAN".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                self.state.write_varnode(out, if a.is_nan() { 1 } else { 0 });
+            }
+            OpCode::FloatInt2Float => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_INT2FLOAT".into()))?;
+                let a = self.read_input(op, 0)? as i64;
+                self.state.write_varnode(out, (a as f64).to_bits());
+            }
+            OpCode::FloatFloat2Float => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_FLOAT2FLOAT".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                self.state.write_varnode(out, a.to_bits());
+            }
+            OpCode::FloatTrunc => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_TRUNC".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                self.state.write_varnode(out, a.trunc() as i64 as u64);
+            }
+            OpCode::FloatCeil => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_CEIL".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                self.state.write_varnode(out, a.ceil() as i64 as u64);
+            }
+            OpCode::FloatFloor => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_FLOOR".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                self.state.write_varnode(out, a.floor() as i64 as u64);
+            }
+            OpCode::FloatRound => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_ROUND".into()))?;
+                let a = f64::from_bits(self.read_input(op, 0)?);
+                self.state.write_varnode(out, a.round() as i64 as u64);
+            }
+            OpCode::IntCarry => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_CARRY".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if a.checked_add(b).is_none() { 1 } else { 0 });
+            }
+            OpCode::IntSCarry => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SCARRY".into()))?;
+                let a = self.read_input(op, 0)? as i64;
+                let b = self.read_input(op, 1)? as i64;
+                self.state.write_varnode(out, if a.checked_add(b).is_none() { 1 } else { 0 });
+            }
+            OpCode::IntSBorrow => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SBORROW".into()))?;
+                let a = self.read_input(op, 0)? as i64;
+                let b = self.read_input(op, 1)? as i64;
+                self.state.write_varnode(out, if a.checked_sub(b).is_none() { 1 } else { 0 });
+            }
+            OpCode::IntLessEqual => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_LESSEQUAL".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if a <= b { 1 } else { 0 });
+            }
+            OpCode::IntSLessEqual => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SLESSEQUAL".into()))?;
+                let a = self.read_input(op, 0)? as i64;
+                let b = self.read_input(op, 1)? as i64;
+                self.state.write_varnode(out, if a <= b { 1 } else { 0 });
+            }
+            OpCode::IntDiv => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_DIV".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if b != 0 { a / b } else { 0 });
+            }
+            OpCode::IntSDiv => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SDIV".into()))?;
+                let a = self.read_input(op, 0)? as i64;
+                let b = self.read_input(op, 1)? as i64;
+                self.state.write_varnode(out, if b != 0 { (a / b) as u64 } else { 0 });
+            }
+            OpCode::IntRem => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_REM".into()))?;
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                self.state.write_varnode(out, if b != 0 { a % b } else { 0 });
+            }
+            OpCode::IntSRem => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SREM".into()))?;
+                let a = self.read_input(op, 0)? as i64;
+                let b = self.read_input(op, 1)? as i64;
+                self.state.write_varnode(out, if b != 0 { (a % b) as u64 } else { 0 });
+            }
+            OpCode::Insert => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INSERT".into()))?;
+                let base = self.read_input(op, 0)?;
+                let val = self.read_input(op, 1)?;
+                let pos = self.read_input(op, 2)? as u32;
+                let sz = if op.inputs.len() > 3 { self.read_input(op, 3)? as u32 } else { 1 };
+                let mask = ((1u64 << sz) - 1) << pos;
+                self.state.write_varnode(out, (base & !mask) | ((val << pos) & mask));
+            }
+            OpCode::ZPull => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("ZPULL".into()))?;
+                let val = self.read_input(op, 0)?;
+                let pos = self.read_input(op, 1)? as u32;
+                let sz = if op.inputs.len() > 2 { self.read_input(op, 2)? as u32 } else { 1 };
+                self.state.write_varnode(out, (val >> pos) & ((1u64 << sz) - 1));
+            }
+            OpCode::SPull => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("SPULL".into()))?;
+                let val = self.read_input(op, 0)? as i64;
+                let pos = self.read_input(op, 1)? as u32;
+                let sz = if op.inputs.len() > 2 { self.read_input(op, 2)? as u32 } else { 1 };
+                let extracted = (val >> pos) & ((1i64 << sz) - 1);
+                let sign_bit = 1i64 << (sz - 1);
+                let sign_extended = if extracted & sign_bit != 0 {
+                    extracted | !((1i64 << sz) - 1)
+                } else {
+                    extracted
+                };
+                self.state.write_varnode(out, sign_extended as u64);
+            }
+            OpCode::MultiEqual | OpCode::Indirect | OpCode::Cast
+            | OpCode::PtrAdd | OpCode::PtrSub | OpCode::SegmentOp
+            | OpCode::CPoolRef | OpCode::New => {
+                if let Some(out) = &op.output {
+                    let val = if !op.inputs.is_empty() { self.read_input(op, 0)? } else { 0 };
+                    self.state.write_varnode(out, val);
+                }
+            }
+            OpCode::BranchInd => {
+                let target = self.read_input(op, 0)?;
+                return Err(EmulatorError::Branch(target));
+            }
+            OpCode::CallInd => {
+                let target = self.read_input(op, 0)?;
+                return Err(EmulatorError::Call(target));
             }
         }
 

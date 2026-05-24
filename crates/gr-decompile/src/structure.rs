@@ -26,6 +26,11 @@ pub enum StructuredBlock {
         header: BlockId,
         body: Box<StructuredBlock>,
     },
+    Switch {
+        condition_block: BlockId,
+        cases: Vec<(u64, StructuredBlock)>,
+        default: Option<Box<StructuredBlock>>,
+    },
     Goto(BlockId),
 }
 

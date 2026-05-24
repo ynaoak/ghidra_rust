@@ -93,15 +93,52 @@ pub fn parse_dwarf(data: &[u8]) -> Result<DwarfInfo, String> {
         collect_type_names(&dwarf, &unit, &header, &mut type_names);
 
         let mut entries = unit.entries();
-        while let Ok(Some((_, entry))) = entries.next_dfs() {
-            if entry.tag() == gimli::DW_TAG_subprogram
-                && let Some(func) = parse_subprogram(&dwarf, &unit, entry, &type_names) {
+        let mut current_func: Option<DwarfFunctionInfo> = None;
+        while let Ok(Some((depth, entry))) = entries.next_dfs() {
+            if depth <= 1
+                && let Some(func) = current_func.take() {
                     info.functions.push(func);
                 }
-            if entry.tag() == gimli::DW_TAG_compile_unit
+            if entry.tag() == gimli::DW_TAG_subprogram {
+                current_func = parse_subprogram(&dwarf, &unit, entry, &type_names);
+            } else if entry.tag() == gimli::DW_TAG_formal_parameter {
+                if let Some(ref mut func) = current_func {
+                    let param_name = get_attr_string(&dwarf, &unit, entry, gimli::DW_AT_name)
+                        .unwrap_or_else(|| format!("param_{}", func.parameters.len()));
+                    let type_name = entry
+                        .attr_value(gimli::DW_AT_type)
+                        .ok()
+                        .flatten()
+                        .and_then(|v| resolve_type_ref(v, &type_names))
+                        .unwrap_or_else(|| "unknown".into());
+                    func.parameters.push(DwarfParameter {
+                        name: param_name,
+                        type_name,
+                        location: None,
+                    });
+                }
+            } else if entry.tag() == gimli::DW_TAG_variable && depth > 1 {
+                if let Some(ref mut func) = current_func
+                    && let Some(var_name) = get_attr_string(&dwarf, &unit, entry, gimli::DW_AT_name) {
+                        let type_name = entry
+                            .attr_value(gimli::DW_AT_type)
+                            .ok()
+                            .flatten()
+                            .and_then(|v| resolve_type_ref(v, &type_names))
+                            .unwrap_or_else(|| "unknown".into());
+                        func.variables.push(DwarfVariable {
+                            name: var_name,
+                            type_name,
+                            stack_offset: None,
+                        });
+                    }
+            } else if entry.tag() == gimli::DW_TAG_compile_unit
                 && let Some(name) = get_attr_string(&dwarf, &unit, entry, gimli::DW_AT_name) {
                     info.compile_units.push(name);
                 }
+        }
+        if let Some(func) = current_func.take() {
+            info.functions.push(func);
         }
     }
 

@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod callgraph;
+pub mod dataref;
 pub mod demangle;
 pub mod discovery;
 pub mod manager;
@@ -7,6 +8,7 @@ pub mod propagation;
 pub mod references;
 pub mod stack;
 pub mod strings;
+pub mod thunk;
 
 pub use analyzer::Analyzer;
 pub use callgraph::CallGraph;
