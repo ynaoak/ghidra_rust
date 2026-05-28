@@ -27,7 +27,6 @@ const UNIQUE_SPACE: SpaceId = SpaceId::UNIQUE;
 //   nzcv:    offset = 0x200, size = 4
 // ---------------------------------------------------------------------------
 const SP_OFFSET: u64 = 31 * 8;
-const _PC_OFFSET: u64 = 32 * 8;
 const XZR_OFFSET: u64 = 33 * 8;
 const NZCV_OFFSET: u64 = 0x200;
 
