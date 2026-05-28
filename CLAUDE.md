@@ -29,6 +29,7 @@ cargo run -- export <binary> [-o <output.json>]
 cargo run -- export-xml <binary> [-o <output.xml>]
 cargo run -- emulate <binary> [--start <hex-addr>] [-n <steps>] [--break <hex-addr>]
 cargo run -- gdbserver <binary> [--start <hex-addr>] [--listen 127.0.0.1:1234]
+cargo run -- debug <binary> [--start <hex-addr>]
 cargo run -- strings <binary> [--min-length <n>] [--all]
 cargo run -- diff <binary_a> <binary_b>
 cargo run -- imports <binary> [--exports]
@@ -51,7 +52,7 @@ cargo run -- script <binary> <script.grs>
 | `gr-emulator` | Full P-code emulator, breakpoints, watchpoints, traces, snapshots, GDB RSP client+server, syscalls, hooks |
 | `gr-decompile` | CFG/SSA/dominator/dataflow, 5 optimization passes (DCE/fold/propagate/strength/algebra), type inference, C/Rust output, SARIF |
 | `gr-sleigh` | SLEIGH runtime: PackedDecode, DecisionNode, ContextDB, .sla zlib decode, ParserWalker |
-| `gr-cli` | 23 CLI commands |
+| `gr-cli` | 24 CLI commands |
 
 ## Architecture Decisions
 

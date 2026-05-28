@@ -18,4 +18,5 @@ pub use breakpoint::{BreakCondition, Breakpoint, BreakpointManager};
 pub use emulator::Emulator;
 pub use gdbserver::{DebugTarget, GdbStub, StopReason};
 pub use state::EmulatorState;
+pub use tui::{parse_debug_command, DebugCommand};
 pub use trace::{MemoryProtection, PagePermissions, TraceLog, TraceRecord};

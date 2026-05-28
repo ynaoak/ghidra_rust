@@ -145,6 +145,14 @@ enum Commands {
         #[arg(short, long, default_value = "127.0.0.1:1234")]
         listen: String,
     },
+    /// Interactive debugger (step, breakpoints, registers, memory)
+    Debug {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Start address (hex). Defaults to entry point
+        #[arg(short, long, value_parser = parse_hex)]
+        start: Option<u64>,
+    },
     /// Hex dump at a given address
     Hexdump {
         /// Path to the binary file
@@ -266,6 +274,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::ExportXml { file, output } => cmd_export_xml(&file, output.as_deref()),
         Commands::Emulate { file, start, steps, breakpoints } => cmd_emulate(&file, start, steps, &breakpoints),
         Commands::Gdbserver { file, start, listen } => cmd_gdbserver(&file, start, &listen),
+        Commands::Debug { file, start } => cmd_debug(&file, start),
         Commands::Hexdump {
             file,
             address,
@@ -820,6 +829,57 @@ impl EmulatorTarget {
         self.pc = next;
         gr_emulator::StopReason::Trap
     }
+
+    fn current_pc(&self) -> u64 {
+        self.pc
+    }
+
+    fn has_exited(&self) -> bool {
+        self.exited
+    }
+
+    /// Disassemble `count` instructions starting at `addr` (or current PC).
+    fn disassemble(&self, addr: Option<u64>, count: usize) -> Vec<(u64, String)> {
+        let mut at = addr.unwrap_or(self.pc);
+        let mut out = Vec::new();
+        for _ in 0..count {
+            match self.lifter.lift_instruction(&self.memory, at) {
+                Ok(insn) => {
+                    out.push((at, insn.mnemonic.clone()));
+                    if insn.length == 0 {
+                        break;
+                    }
+                    at += insn.length as u64;
+                }
+                Err(_) => break,
+            }
+        }
+        out
+    }
+}
+
+/// Build an emulator debug target from a loaded binary, taking ownership of its memory.
+fn build_emulator_target(
+    info: gr_loader::BinaryInfo,
+    entry: u64,
+) -> Option<EmulatorTarget> {
+    let lifter = create_lifter(info.arch, info.bits)?;
+    let is_64 = info.bits == 64;
+    let mut emu = gr_emulator::Emulator::new();
+    for block in info.memory.blocks() {
+        if let Some(data) = &block.data {
+            emu.state.load_memory_bytes(block.start, data);
+        }
+    }
+    emu.state.write_register(0x20, if is_64 { 8 } else { 4 }, if is_64 { 0x7FFF_FFFF_FFF0 } else { 0xFFFF_FFF0 });
+    Some(EmulatorTarget {
+        emu,
+        lifter,
+        memory: info.memory,
+        pc: entry,
+        breakpoints: std::collections::BTreeSet::new(),
+        exited: false,
+    })
 }
 
 impl gr_emulator::DebugTarget for EmulatorTarget {
@@ -871,32 +931,15 @@ impl gr_emulator::DebugTarget for EmulatorTarget {
 
 fn cmd_gdbserver(path: &Path, start: Option<u64>, listen: &str) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
+    let arch = info.arch;
+    let entry = start.unwrap_or(info.entry_point);
 
-    let lifter = match create_lifter(info.arch, info.bits) {
-        Some(l) => l,
+    let target = match build_emulator_target(info, entry) {
+        Some(t) => t,
         None => {
-            eprintln!("Emulation not yet supported for {}", info.arch);
+            eprintln!("Emulation not yet supported for {}", arch);
             return Ok(());
         }
-    };
-
-    let is_64 = info.bits == 64;
-    let mut emu = gr_emulator::Emulator::new();
-    for block in info.memory.blocks() {
-        if let Some(data) = &block.data {
-            emu.state.load_memory_bytes(block.start, data);
-        }
-    }
-    emu.state.write_register(0x20, if is_64 { 8 } else { 4 }, if is_64 { 0x7FFF_FFFF_FFF0 } else { 0xFFFF_FFF0 });
-
-    let entry = start.unwrap_or(info.entry_point);
-    let target = EmulatorTarget {
-        emu,
-        lifter,
-        memory: info.memory,
-        pc: entry,
-        breakpoints: std::collections::BTreeSet::new(),
-        exited: false,
     };
 
     println!("GDB server listening on {} (entry 0x{:x})", listen, entry);
@@ -904,6 +947,119 @@ fn cmd_gdbserver(path: &Path, start: Option<u64>, listen: &str) -> Result<(), Bo
     gr_emulator::gdbserver::serve(listen, target)?;
     println!("GDB client disconnected.");
     Ok(())
+}
+
+fn cmd_debug(path: &Path, start: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    use gr_emulator::DebugTarget as _;
+    use gr_emulator::tui;
+
+    let info = BinaryLoader::load(path)?;
+    let arch = info.arch;
+    let entry = start.unwrap_or(info.entry_point);
+
+    let mut target = match build_emulator_target(info, entry) {
+        Some(t) => t,
+        None => {
+            eprintln!("Emulation not yet supported for {}", arch);
+            return Ok(());
+        }
+    };
+
+    println!("Interactive debugger ({}). Type 'help' for commands.", arch);
+    print_current_location(&target);
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("(dbg 0x{:x})> ", target.current_pc());
+        std::io::stdout().flush().ok();
+
+        line.clear();
+        if stdin.read_line(&mut line)? == 0 {
+            break; // EOF
+        }
+
+        match gr_emulator::parse_debug_command(&line) {
+            gr_emulator::DebugCommand::Quit => break,
+            gr_emulator::DebugCommand::Empty => {}
+            gr_emulator::DebugCommand::Help => println!("{}", tui::debug_help()),
+            gr_emulator::DebugCommand::Step => {
+                let reason = target.resume(true);
+                report_stop(&target, reason);
+            }
+            gr_emulator::DebugCommand::Continue => {
+                let reason = target.resume(false);
+                report_stop(&target, reason);
+            }
+            gr_emulator::DebugCommand::Registers => {
+                print_registers(&target);
+            }
+            gr_emulator::DebugCommand::Breakpoint(addr) => {
+                target.add_breakpoint(addr);
+                println!("Breakpoint set at 0x{:x}", addr);
+            }
+            gr_emulator::DebugCommand::DeleteBreakpoint(addr) => {
+                target.remove_breakpoint(addr);
+                println!("Breakpoint removed at 0x{:x}", addr);
+            }
+            gr_emulator::DebugCommand::Examine { addr, len } => {
+                let at = addr.unwrap_or(target.current_pc());
+                let bytes = target.read_memory(at, len);
+                print!("{}", tui::format_memory_dump(&bytes, at, 16));
+            }
+            gr_emulator::DebugCommand::Disassemble { addr, count } => {
+                for (a, text) in target.disassemble(addr, count) {
+                    let marker = if a == target.current_pc() { "=>" } else { "  " };
+                    println!("{} 0x{:08x}  {}", marker, a, text);
+                }
+            }
+            gr_emulator::DebugCommand::Info => print_current_location(&target),
+            gr_emulator::DebugCommand::Unknown(s) => {
+                println!("Unknown command: '{}' (type 'help')", s);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_current_location(target: &EmulatorTarget) {
+    if target.has_exited() {
+        println!("Program has exited.");
+        return;
+    }
+    let disasm = target.disassemble(None, 1);
+    if let Some((addr, text)) = disasm.first() {
+        println!("=> 0x{:08x}  {}", addr, text);
+    }
+}
+
+fn report_stop(target: &EmulatorTarget, reason: gr_emulator::StopReason) {
+    match reason {
+        gr_emulator::StopReason::Trap => print_current_location(target),
+        gr_emulator::StopReason::Exited(code) => println!("Program exited (code {})", code),
+        gr_emulator::StopReason::Signal(s) => println!("Stopped on signal {}", s),
+    }
+}
+
+fn print_registers(target: &EmulatorTarget) {
+    use gr_emulator::DebugTarget as _;
+    let block = target.read_registers();
+    let names = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                 "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip"];
+    for (i, name) in names.iter().enumerate() {
+        let start = i * 8;
+        if start + 8 <= block.len() {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&block[start..start + 8]);
+            let val = u64::from_le_bytes(buf);
+            print!("{:<4}= 0x{:016x}  ", name, val);
+            if (i + 1) % 3 == 0 {
+                println!();
+            }
+        }
+    }
+    println!();
 }
 
 fn cmd_strings(path: &Path, min_length: usize, all_sections: bool) -> Result<(), Box<dyn std::error::Error>> {
