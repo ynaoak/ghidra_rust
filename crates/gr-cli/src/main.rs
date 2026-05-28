@@ -7,7 +7,7 @@ use gr_arch::arch::create_architecture;
 use gr_lift::aarch64::Aarch64Lifter;
 use gr_lift::x86::X86Lifter;
 use gr_lift::PcodeLift;
-use gr_loader::{BinaryLoader, SectionFlags, SymbolKind};
+use gr_loader::{BinaryLoader, Memory, SectionFlags, SymbolKind};
 use gr_program::{Program, ProgramDiff, ProjectSummary};
 
 #[derive(Parser)]
@@ -134,6 +134,17 @@ enum Commands {
         #[arg(short = 'b', long = "break", value_parser = parse_hex)]
         breakpoints: Vec<u64>,
     },
+    /// Start a GDB remote (RSP) server for the emulator
+    Gdbserver {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Start address (hex). Defaults to entry point
+        #[arg(short, long, value_parser = parse_hex)]
+        start: Option<u64>,
+        /// Listen address (host:port)
+        #[arg(short, long, default_value = "127.0.0.1:1234")]
+        listen: String,
+    },
     /// Hex dump at a given address
     Hexdump {
         /// Path to the binary file
@@ -254,6 +265,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
         Commands::ExportXml { file, output } => cmd_export_xml(&file, output.as_deref()),
         Commands::Emulate { file, start, steps, breakpoints } => cmd_emulate(&file, start, steps, &breakpoints),
+        Commands::Gdbserver { file, start, listen } => cmd_gdbserver(&file, start, &listen),
         Commands::Hexdump {
             file,
             address,
@@ -767,6 +779,130 @@ fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u
     for (name, val) in emu.state.dump_registers() {
         if val != 0 { println!("  {:<6} = 0x{:016x}", name, val); }
     }
+    Ok(())
+}
+
+/// A live emulator wired up as a GDB debug target.
+struct EmulatorTarget {
+    emu: gr_emulator::Emulator,
+    lifter: Box<dyn PcodeLift>,
+    memory: Memory,
+    pc: u64,
+    breakpoints: std::collections::BTreeSet<u64>,
+    exited: bool,
+}
+
+impl EmulatorTarget {
+    const MAX_CONTINUE_STEPS: u64 = 10_000_000;
+
+    /// Execute a single instruction at the current PC, advancing it.
+    fn step_one(&mut self) -> gr_emulator::StopReason {
+        if self.exited {
+            return gr_emulator::StopReason::Exited(0);
+        }
+        let lifted = match self.lifter.lift_instruction(&self.memory, self.pc) {
+            Ok(l) => l,
+            Err(_) => {
+                self.exited = true;
+                return gr_emulator::StopReason::Signal(4); // SIGILL
+            }
+        };
+        let next = self.pc + lifted.length as u64;
+        for op in &lifted.ops {
+            match self.emu.execute_op(op) {
+                Ok(()) => {}
+                Err(gr_emulator::emulator::EmulatorError::Branch(t)) => { self.pc = t; return gr_emulator::StopReason::Trap; }
+                Err(gr_emulator::emulator::EmulatorError::Call(t)) => { self.pc = t; return gr_emulator::StopReason::Trap; }
+                Err(gr_emulator::emulator::EmulatorError::Return(_)) => { self.exited = true; return gr_emulator::StopReason::Exited(0); }
+                Err(_) => { self.exited = true; return gr_emulator::StopReason::Signal(11); } // SIGSEGV
+            }
+        }
+        self.pc = next;
+        gr_emulator::StopReason::Trap
+    }
+}
+
+impl gr_emulator::DebugTarget for EmulatorTarget {
+    fn read_registers(&self) -> Vec<u8> {
+        let mut state = self.emu.state.clone();
+        state.write_register(gr_emulator::gdbserver::AMD64_PC_OFFSET, 8, self.pc);
+        gr_emulator::gdbserver::amd64_read_registers(&state)
+    }
+
+    fn write_registers(&mut self, data: &[u8]) {
+        gr_emulator::gdbserver::amd64_write_registers(&mut self.emu.state, data);
+        self.pc = self.emu.state.read_register(gr_emulator::gdbserver::AMD64_PC_OFFSET, 8);
+    }
+
+    fn read_memory(&self, addr: u64, len: usize) -> Vec<u8> {
+        (0..len as u64)
+            .map(|i| self.memory.read_byte(addr + i).unwrap_or(0))
+            .collect()
+    }
+
+    fn write_memory(&mut self, addr: u64, data: &[u8]) {
+        self.emu.state.load_memory_bytes(addr, data);
+    }
+
+    fn resume(&mut self, step: bool) -> gr_emulator::StopReason {
+        if step {
+            return self.step_one();
+        }
+        for _ in 0..Self::MAX_CONTINUE_STEPS {
+            let reason = self.step_one();
+            if !matches!(reason, gr_emulator::StopReason::Trap) {
+                return reason;
+            }
+            if self.breakpoints.contains(&self.pc) {
+                return gr_emulator::StopReason::Trap;
+            }
+        }
+        gr_emulator::StopReason::Trap
+    }
+
+    fn add_breakpoint(&mut self, addr: u64) {
+        self.breakpoints.insert(addr);
+    }
+
+    fn remove_breakpoint(&mut self, addr: u64) {
+        self.breakpoints.remove(&addr);
+    }
+}
+
+fn cmd_gdbserver(path: &Path, start: Option<u64>, listen: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+
+    let lifter = match create_lifter(info.arch, info.bits) {
+        Some(l) => l,
+        None => {
+            eprintln!("Emulation not yet supported for {}", info.arch);
+            return Ok(());
+        }
+    };
+
+    let is_64 = info.bits == 64;
+    let mut emu = gr_emulator::Emulator::new();
+    for block in info.memory.blocks() {
+        if let Some(data) = &block.data {
+            emu.state.load_memory_bytes(block.start, data);
+        }
+    }
+    emu.state.write_register(0x20, if is_64 { 8 } else { 4 }, if is_64 { 0x7FFF_FFFF_FFF0 } else { 0xFFFF_FFF0 });
+
+    let entry = start.unwrap_or(info.entry_point);
+    let target = EmulatorTarget {
+        emu,
+        lifter,
+        memory: info.memory,
+        pc: entry,
+        breakpoints: std::collections::BTreeSet::new(),
+        exited: false,
+    };
+
+    println!("GDB server listening on {} (entry 0x{:x})", listen, entry);
+    println!("Connect with: gdb -ex 'target remote {}'", listen);
+    gr_emulator::gdbserver::serve(listen, target)?;
+    println!("GDB client disconnected.");
     Ok(())
 }
 

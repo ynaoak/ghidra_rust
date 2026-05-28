@@ -1,6 +1,7 @@
 pub mod breakpoint;
 pub mod debugger;
 pub mod emulator;
+pub mod gdbserver;
 pub mod hooks;
 pub mod memory_model;
 pub mod network;
@@ -15,5 +16,6 @@ pub mod trace;
 
 pub use breakpoint::{BreakCondition, Breakpoint, BreakpointManager};
 pub use emulator::Emulator;
+pub use gdbserver::{DebugTarget, GdbStub, StopReason};
 pub use state::EmulatorState;
 pub use trace::{MemoryProtection, PagePermissions, TraceLog, TraceRecord};
