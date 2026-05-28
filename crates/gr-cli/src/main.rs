@@ -104,6 +104,17 @@ enum Commands {
         #[arg(long)]
         rust: bool,
     },
+    /// Taint analysis: track parameters to dangerous sinks
+    Taint {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Function address (hex). Defaults to entry point
+        #[arg(short, long, value_parser = parse_hex)]
+        address: Option<u64>,
+        /// Number of parameter registers to treat as tainted
+        #[arg(short, long, default_value = "6")]
+        params: usize,
+    },
     /// Export analysis results to JSON
     Export {
         /// Path to the binary file
@@ -270,6 +281,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             count,
         } => cmd_pcode(&file, start, count),
         Commands::Decompile { file, address, ssa, rust } => cmd_decompile(&file, address, ssa, rust),
+        Commands::Taint { file, address, params } => cmd_taint(&file, address, params),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
         Commands::ExportXml { file, output } => cmd_export_xml(&file, output.as_deref()),
         Commands::Emulate { file, start, steps, breakpoints } => cmd_emulate(&file, start, steps, &breakpoints),
@@ -688,6 +700,46 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
         result.stats.live_ops_after,
         result.stats.optimization,
     );
+    Ok(())
+}
+
+fn cmd_taint(path: &Path, address: Option<u64>, params: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    let lifter = match create_lifter(program.info.arch, program.info.bits) {
+        Some(l) => l,
+        None => {
+            eprintln!("Taint analysis not yet supported for {}", program.info.arch);
+            return Ok(());
+        }
+    };
+
+    // System V AMD64 parameter-passing order (REGISTER-space offsets).
+    const SYSV_PARAM_REGS: [(u64, &str); 6] = [
+        (0x38, "rdi"), (0x30, "rsi"), (0x10, "rdx"),
+        (0x08, "rcx"), (0x80, "r8"), (0x88, "r9"),
+    ];
+    let n = params.min(SYSV_PARAM_REGS.len());
+    let offsets: Vec<u64> = SYSV_PARAM_REGS[..n].iter().map(|(o, _)| *o).collect();
+
+    let entry = address.unwrap_or(program.entry_point());
+    let report = gr_decompile::analyze_taint(lifter.as_ref(), &program, entry, &offsets)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    let names: Vec<&str> = SYSV_PARAM_REGS[..n].iter().map(|(_, name)| *name).collect();
+    println!("Taint analysis at 0x{:x}", entry);
+    println!("  Tainted sources: {} ({})", n, names.join(", "));
+    println!("  Tainted values:  {}", report.tainted_values);
+    println!("{}", "-".repeat(60));
+
+    if report.sinks.is_empty() {
+        println!("  No tainted data reaches a dangerous sink.");
+    } else {
+        println!("  {} tainted sink(s) found:", report.sinks.len());
+        for sink in &report.sinks {
+            println!("    0x{:x}  {}", sink.address, sink.kind.describe());
+        }
+    }
     Ok(())
 }
 

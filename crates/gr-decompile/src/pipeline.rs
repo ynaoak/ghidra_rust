@@ -114,6 +114,57 @@ pub fn decompile_function(
     build_decompile_result(&terminated, &func_name, func_entry, &symbols, &string_literals, &stack_vars)
 }
 
+/// Result of taint-tracking a function from its parameters.
+pub struct TaintReport {
+    pub tainted_values: usize,
+    pub sinks: Vec<crate::taint::TaintSink>,
+}
+
+/// Lift a function, build SSA, mark the given parameter registers as tainted,
+/// and report where tainted data reaches dangerous sinks.
+///
+/// `param_offsets` are REGISTER-space offsets of the parameter registers in
+/// calling-convention order.
+pub fn analyze_taint(
+    lifter: &dyn PcodeLift,
+    program: &Program,
+    func_entry: u64,
+    param_offsets: &[u64],
+) -> Result<TaintReport, String> {
+    let func = program.listing.get_function(func_entry);
+    let max_insns = func
+        .map(|f| f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(100))
+        .unwrap_or(500);
+
+    let lifted = lifter
+        .lift_range(&program.info.memory, func_entry, max_insns)
+        .map_err(|e| e.to_string())?;
+    if lifted.is_empty() {
+        return Err(format!("no instructions at 0x{:x}", func_entry));
+    }
+
+    let terminated = if func.is_some() {
+        trim_to_function_body(&lifted, func_entry, func)
+    } else {
+        trim_to_return(&lifted)
+    };
+
+    let cfg = ControlFlowGraph::build(&terminated);
+    let ssa = SsaFunction::from_cfg("taint".to_string(), func_entry, cfg);
+
+    let mut engine = crate::taint::TaintEngine::new();
+    for &off in param_offsets {
+        engine.add_source_register(&ssa, off);
+    }
+    engine.propagate(&ssa);
+    let sinks = engine.find_sinks(&ssa);
+
+    Ok(TaintReport {
+        tainted_values: engine.tainted_count(),
+        sinks,
+    })
+}
+
 fn build_decompile_result(
     instructions: &[LiftedInstruction],
     func_name: &str,

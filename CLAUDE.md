@@ -25,6 +25,7 @@ cargo run -- xrefs <binary> <hex-address>
 cargo run -- callgraph <binary> [--dot]
 cargo run -- pcode <binary> [--start <hex-addr>] [-n <count>]
 cargo run -- decompile <binary> [--address <hex-addr>] [--ssa] [--rust]
+cargo run -- taint <binary> [--address <hex-addr>] [--params <n>]
 cargo run -- export <binary> [-o <output.json>]
 cargo run -- export-xml <binary> [-o <output.xml>]
 cargo run -- emulate <binary> [--start <hex-addr>] [-n <steps>] [--break <hex-addr>]
@@ -50,9 +51,9 @@ cargo run -- script <binary> <script.grs>
 | `gr-analysis` | 30 analyzers (function discovery, strings, stack, VTable, calling convention, coverage, ...) |
 | `gr-lift` | x86/AArch64 → P-code lifter (30+ instructions, memory operands, EFLAGS/NZCV) |
 | `gr-emulator` | Full P-code emulator, breakpoints, watchpoints, traces, snapshots, GDB RSP client+server, syscalls, hooks |
-| `gr-decompile` | CFG/SSA/dominator/dataflow, 6 optimization passes (DCE/fold/propagate/strength/algebra/CSE), struct/array type recovery, C/Rust output, SARIF |
+| `gr-decompile` | CFG/SSA/dominator/dataflow, 6 optimization passes (DCE/fold/propagate/strength/algebra/CSE), struct/array type recovery, taint analysis, C/Rust output, SARIF |
 | `gr-sleigh` | SLEIGH runtime: PackedDecode, DecisionNode, ContextDB, .sla zlib decode, ParserWalker |
-| `gr-cli` | 24 CLI commands |
+| `gr-cli` | 25 CLI commands |
 
 ## Architecture Decisions
 
