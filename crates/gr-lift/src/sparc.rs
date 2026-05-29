@@ -7,13 +7,16 @@
 //! disassembly text. SPARC is big-endian with fixed 4-byte instructions; `%g0`
 //! reads as 0 and discards writes.
 //!
-//! ADDX/SUBX use the icc carry. Non-annulling branch delay slots are honoured
-//! via a `LiftContext`: a CALL/JMPL/non-annulling-Bicc defers its control
-//! transfer past the following (delay-slot) instruction, whose effects run
-//! first (the stateless `lift_instruction` path still emits the transfer
-//! inline). Remaining simplifications: annulling branches are not deferred, and
-//! SAVE/RESTORE model only the pointer arithmetic, not the register-window
-//! rotation.
+//! ADDX/SUBX use the icc carry. Branch delay slots are honoured via a
+//! `LiftContext`: a CALL/JMPL/Bicc defers its control transfer past the
+//! following (delay-slot) instruction, whose effects run first, and the branch
+//! condition is snapshotted before the slot. For an annulling conditional
+//! branch the delay slot runs only when taken, so its register writes are
+//! predicated on the condition; `ba,a` stays inline (its annulled slot is
+//! skipped). The stateless `lift_instruction` path still emits the transfer
+//! inline. Remaining simplifications: guarded delay-slot stores and `bn,a` are
+//! not annulled, and SAVE/RESTORE model only the pointer arithmetic, not the
+//! register-window rotation.
 
 use gr_core::address::{Address, SpaceId};
 use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
@@ -392,15 +395,27 @@ fn is_control(op: OpCode) -> bool {
 }
 
 impl SparcLifter {
-    /// Whether `word` is a non-annulling control-transfer instruction (CALL,
-    /// JMPL, or a non-annulling Bicc) — the forms whose delay slot always
-    /// executes before the transfer.
-    fn is_nonannul_cti(word: u32) -> bool {
+    /// Decide how `word`'s delay slot is handled: `(defer, predicate)`.
+    /// `defer` = move the control transfer past the delay slot; `predicate` =
+    /// the delay slot runs only when the branch is taken (annulling conditional)
+    /// so its register writes are guarded by the condition.
+    ///
+    /// `ba,a` is left inline (the transfer skips the annulled delay slot), and
+    /// `bn`/`bn,a` produce no transfer.
+    fn cti_decision(word: u32) -> (bool, bool) {
         match word >> 30 {
-            1 => true,                                   // CALL
-            0 => (word >> 22) & 7 == 2 && (word >> 29) & 1 == 0, // Bicc, annul bit clear
-            2 => (word >> 19) & 0x3F == 0x38,            // JMPL
-            _ => false,
+            1 => (true, false),                                  // CALL
+            2 if (word >> 19) & 0x3F == 0x38 => (true, false),   // JMPL
+            0 if (word >> 22) & 7 == 2 => {
+                let cond = (word >> 25) & 0xF;
+                let annul = (word >> 29) & 1 == 1;
+                match cond {
+                    8 => (!annul, false), // BA: defer; BA,a stays inline (skips slot)
+                    0 => (false, false),  // BN: no transfer
+                    _ => (true, annul),   // conditional: defer; annulling predicates slot
+                }
+            }
+            _ => (false, false),
         }
     }
 
@@ -408,6 +423,61 @@ impl SparcLifter {
         let mut buf = [0u8; 4];
         memory.read_bytes(address, &mut buf).ok()?;
         Some(u32::from_be_bytes(buf))
+    }
+
+    /// Predicate a delay-slot instruction's register writes on `cond`
+    /// (branch-free), for annulling conditional branches. Stores are not
+    /// guarded (rare in delay slots; documented).
+    fn predicate_delay_slot(&self, ops: Vec<PcodeOp>, cond: VarnodeData, address: u64) -> Vec<PcodeOp> {
+        let mut regs: Vec<VarnodeData> = Vec::new();
+        for op in &ops {
+            if let Some(out) = op.output
+                && out.space == REG_SPACE
+                && !regs.iter().any(|r| r.offset == out.offset && r.size == out.size)
+            {
+                regs.push(out);
+            }
+        }
+        if regs.is_empty() {
+            return ops;
+        }
+        let mut out: Vec<PcodeOp> = Vec::new();
+        let mut s = 0u32;
+        let mut olds = Vec::new();
+        for (i, r) in regs.iter().enumerate() {
+            let o = unique(0x800 + i as u64 * 8, r.size);
+            self.push(&mut out, &mut s, OpCode::Copy, Some(o), &[*r], address);
+            olds.push(o);
+        }
+        for mut op in ops {
+            op.seq = SeqNum::new(Address::new(RAM_SPACE, address), s);
+            s += 1;
+            out.push(op);
+        }
+        for (r, old) in regs.iter().zip(olds.iter()) {
+            self.emit_select(cond, *r, *old, &mut out, &mut s, address);
+        }
+        out
+    }
+
+    /// Branch-free `dst = cond ? dst : old` for an arbitrary-size register.
+    fn emit_select(&self, cond: VarnodeData, dst: VarnodeData, old: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let size = dst.size;
+        let cz = unique(0x780, size);
+        if size == 1 {
+            self.push(ops, s, OpCode::Copy, Some(cz), &[cond], address);
+        } else {
+            self.push(ops, s, OpCode::IntZExt, Some(cz), &[cond], address);
+        }
+        let mask = unique(0x788, size);
+        self.push(ops, s, OpCode::Int2Comp, Some(mask), &[cz], address);
+        let a = unique(0x790, size);
+        self.push(ops, s, OpCode::IntAnd, Some(a), &[dst, mask], address);
+        let nmask = unique(0x798, size);
+        self.push(ops, s, OpCode::IntNegate, Some(nmask), &[mask], address);
+        let b = unique(0x7A0, size);
+        self.push(ops, s, OpCode::IntAnd, Some(b), &[old, nmask], address);
+        self.push(ops, s, OpCode::IntOr, Some(dst), &[a, b], address);
     }
 }
 
@@ -433,30 +503,39 @@ impl PcodeLift for SparcLifter {
         let mut li = self.lift_instruction(memory, address)?;
 
         if let Some(d) = pending {
+            // Annulling conditional branch: the delay slot runs only when taken,
+            // so guard its register writes on the branch condition.
+            if d.annul
+                && let Some(cond) = d.op.inputs.get(1).copied()
+            {
+                li.ops = self.predicate_delay_slot(li.ops, cond, address);
+            }
             let mut op = d.op;
             op.seq = SeqNum::new(Address::new(RAM_SPACE, address), li.ops.len() as u32);
             li.ops.push(op);
             return Ok(li);
         }
 
-        // A non-annulling CTI defers its trailing control op to the delay slot.
-        if let Some(word) = self.read_word_be(memory, address)
-            && Self::is_nonannul_cti(word)
-            && li.ops.last().map(|o| is_control(o.opcode)).unwrap_or(false)
-        {
-            let mut ctrl = li.ops.pop().unwrap();
-            // SPARC evaluates a branch condition before the delay slot. Snapshot
-            // it into a stable temp at the branch so the deferred CBranch is not
-            // affected by a delay slot that updates the icc flags.
-            if ctrl.opcode == OpCode::CBranch
-                && let Some(cond) = ctrl.inputs.get(1).copied()
-            {
-                let snap = unique(0x540, cond.size);
-                let seq = SeqNum::new(Address::new(RAM_SPACE, address), li.ops.len() as u32);
-                li.ops.push(PcodeOp { opcode: OpCode::Copy, seq, output: Some(snap), inputs: SmallVec::from_slice(&[cond]) });
-                ctrl.inputs[1] = snap;
+        // A control-transfer instruction defers its trailing op past the delay
+        // slot (see cti_decision).
+        if let Some(word) = self.read_word_be(memory, address) {
+            let (defer, annul) = Self::cti_decision(word);
+            if defer && li.ops.last().map(|o| is_control(o.opcode)).unwrap_or(false) {
+                let mut ctrl = li.ops.pop().unwrap();
+                // SPARC evaluates a branch condition before the delay slot.
+                // Snapshot it into a stable temp at the branch so neither the
+                // deferred CBranch nor the delay-slot predication is affected by
+                // a delay slot that updates the icc flags.
+                if ctrl.opcode == OpCode::CBranch
+                    && let Some(cond) = ctrl.inputs.get(1).copied()
+                {
+                    let snap = unique(0x540, cond.size);
+                    let seq = SeqNum::new(Address::new(RAM_SPACE, address), li.ops.len() as u32);
+                    li.ops.push(PcodeOp { opcode: OpCode::Copy, seq, output: Some(snap), inputs: SmallVec::from_slice(&[cond]) });
+                    ctrl.inputs[1] = snap;
+                }
+                ctx.delay = Some(DelaySlot { op: ctrl, addr: address + 4, annul });
             }
-            ctx.delay = Some(DelaySlot { op: ctrl, addr: address + 4 });
         }
         Ok(li)
     }
@@ -753,6 +832,7 @@ mod tests {
                     inputs: SmallVec::from_slice(&[reg(I7_INDEX)]),
                 },
                 addr: 0x1004,
+                annul: false,
             }),
         };
         let ops = lifter.lift_instruction_ctx(&mem, 0x2000, &mut ctx).unwrap().ops;
@@ -767,5 +847,31 @@ mod tests {
         let call = (1 << 30) | 0x10;
         let ops = lift(call);
         assert!(ops.iter().any(|o| o.opcode == OpCode::Call));
+    }
+
+    #[test]
+    fn delay_slot_annulling_predicates_slot() {
+        // be,a +8 ; delay slot: add %o0,1,%o0 (executes only if taken)
+        let bea = (1 << 29) | (1 << 25) | (2 << 22) | 2;
+        let add = f3i(0x00, 8, 8, 1);
+        let (a, b) = lift_ctx_two(bea, add);
+        // Condition snapshotted at the branch; CBranch deferred.
+        assert!(!a.iter().any(|o| o.opcode == OpCode::CBranch));
+        // Delay slot's write is predicated (mask + select) then the branch.
+        assert!(b.iter().any(|o| o.opcode == OpCode::Int2Comp));
+        assert!(b.iter().any(|o| o.opcode == OpCode::IntOr && o.output.map(|v| v.offset == 8 * 4).unwrap_or(false)));
+        assert_eq!(b.last().unwrap().opcode, OpCode::CBranch);
+        assert_eq!(b.last().unwrap().inputs[0].offset, 0x1008);
+    }
+
+    #[test]
+    fn delay_slot_ba_annul_stays_inline() {
+        // ba,a +8 : annulled delay slot -> branch stays inline, slot skipped.
+        let baa = (1 << 29) | (8 << 25) | (2 << 22) | 2;
+        let add = f3i(0x00, 8, 8, 1);
+        let (a, b) = lift_ctx_two(baa, add);
+        assert_eq!(a.last().unwrap().opcode, OpCode::Branch);
+        // No transfer is appended to the following instruction.
+        assert!(!b.iter().any(|o| matches!(o.opcode, OpCode::Branch | OpCode::CBranch)));
     }
 }

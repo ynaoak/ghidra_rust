@@ -88,6 +88,10 @@ pub struct DelaySlot {
     pub op: PcodeOp,
     /// Address of the delay-slot instruction this transfer follows.
     pub addr: u64,
+    /// For an annulling conditional branch the delay slot executes only when
+    /// the branch is taken, so its register writes are predicated on the
+    /// branch condition (`op.inputs[1]`).
+    pub annul: bool,
 }
 
 /// ARM Thumb IT (If-Then) block state.
