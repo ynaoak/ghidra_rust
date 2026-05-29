@@ -1,11 +1,14 @@
-//! ARM32 (A32) → P-code lifter.
+//! ARM32 (A32) and Thumb (T16/T32) → P-code lifter.
 //!
-//! Decodes the common A32 encodings directly into P-code: data processing
+//! Decodes the common encodings directly into P-code: data processing
 //! (immediate and simple shifted-register operand2), single load/store,
 //! block load/store (push/pop), multiply, and branches. Capstone supplies the
 //! disassembly text. Condition codes are honoured for branches (via NZCV flags
-//! computed by cmp/cmn/tst/teq); conditional data-processing is lifted
-//! unconditionally (a documented simplification).
+//! computed by cmp/cmn/tst/teq). Conditional (non-AL) A32 data-processing that
+//! writes a register is modelled branch-free via a select on the condition,
+//! since the emulator/CFG do not support intra-instruction p-code branches.
+//! Conditional compares and conditional load/store are left unconditional, and
+//! Thumb IT-block predication is not modelled (the lifter is stateless).
 
 use gr_core::address::{Address, Endian, SpaceId};
 use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
@@ -692,6 +695,7 @@ impl Arm32Lifter {
         let set_flags = (word >> 20) & 1 == 1;
         let rn = (word >> 16) & 0xF;
         let rd = (word >> 12) & 0xF;
+        let cond = word >> 28;
 
         // Resolve operand2.
         let op2 = if i_bit {
@@ -728,6 +732,20 @@ impl Arm32Lifter {
                 *s += 1;
                 t
             }
+        };
+
+        // Conditional (non-AL) data-processing that writes a register is
+        // modelled branch-free: save the old Rd, compute unconditionally, then
+        // select old vs. new on the condition. Compares (opcodes 8-B) and PC
+        // writes are left as-is.
+        let writes_reg = !(0x8..=0xB).contains(&opcode) && rd != PC_INDEX;
+        let cond_old = if cond != COND_AL && writes_reg {
+            let o = unique(0x778, 4);
+            ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(o), inputs: SmallVec::from_slice(&[reg(rd)]) });
+            *s += 1;
+            Some(o)
+        } else {
+            None
         };
 
         let rn_v = reg(rn);
@@ -767,6 +785,32 @@ impl Arm32Lifter {
             }
             _ => {}
         }
+
+        if let Some(old) = cond_old {
+            let c = self.emit_cond(cond, ops, s, address);
+            self.emit_cond_select(c, reg(rd), old, ops, s, address);
+        }
+    }
+
+    /// Branch-free conditional write: `dst = c ? dst : old`, where `dst` already
+    /// holds the unconditionally-computed result and `c` is a 1-byte boolean.
+    fn emit_cond_select(&self, c: VarnodeData, dst: VarnodeData, old: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
+        let push = |ops: &mut Vec<PcodeOp>, s: &mut u32, op: OpCode, out: VarnodeData, ins: &[VarnodeData]| {
+            ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(out), inputs: SmallVec::from_slice(ins) });
+            *s += 1;
+        };
+        let cz = unique(0x780, 4);
+        push(ops, s, OpCode::IntZExt, cz, &[c]);
+        let mask = unique(0x788, 4);
+        push(ops, s, OpCode::Int2Comp, mask, &[cz]);     // 0 - cz => 0x0 or 0xFFFFFFFF
+        let a = unique(0x790, 4);
+        push(ops, s, OpCode::IntAnd, a, &[dst, mask]);   // new & mask
+        let nmask = unique(0x798, 4);
+        push(ops, s, OpCode::IntNegate, nmask, &[mask]); // ~mask
+        let b = unique(0x7A0, 4);
+        push(ops, s, OpCode::IntAnd, b, &[old, nmask]);  // old & ~mask
+        push(ops, s, OpCode::IntOr, dst, &[a, b]);       // dst = (new & mask) | (old & ~mask)
     }
 
     fn rd_out(&self, rd: u32) -> Option<VarnodeData> {
@@ -1354,6 +1398,31 @@ mod tests {
         assert!(ops.iter().any(|o| o.opcode == OpCode::Load));
         // signed byte -> sign extend
         assert!(ops.iter().any(|o| o.opcode == OpCode::IntSExt));
+    }
+
+    #[test]
+    fn lift_conditional_dp_selects() {
+        // addne r0, r1, r2 => 0x10810002 (cond=NE, ADD)
+        let ops = lift(0x1081_0002);
+        // saves old r0
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Copy && o.output.map(|v| v.space == CoreSpace::UNIQUE).unwrap_or(false)));
+        // unconditional add still present
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntAdd));
+        // select sequence: Int2Comp mask + final IntOr into r0
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Int2Comp));
+        let last = ops.last().unwrap();
+        assert_eq!(last.opcode, OpCode::IntOr);
+        assert_eq!(last.output.unwrap().offset, 0); // writes r0
+        assert_eq!(last.output.unwrap().space, CoreSpace::REGISTER);
+    }
+
+    #[test]
+    fn lift_unconditional_dp_no_select() {
+        // add r0, r1, r2 => 0xE0810002 (cond=AL): no select machinery
+        let ops = lift(0xE081_0002);
+        assert!(!ops.iter().any(|o| o.opcode == OpCode::Int2Comp));
+        let add = ops.iter().find(|o| o.opcode == OpCode::IntAdd).unwrap();
+        assert_eq!(add.output.unwrap().offset, 0);
     }
 
     #[test]
