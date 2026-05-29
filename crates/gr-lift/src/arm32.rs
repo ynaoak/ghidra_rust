@@ -8,15 +8,18 @@
 //! carry-out is not modelled for logical ops). ADC/SBC/RSC use the carry flag.
 //! Conditional (non-AL) A32 data-processing that writes a register is modelled
 //! branch-free via a select on the condition, since the emulator/CFG do not
-//! support intra-instruction p-code branches. Conditional compares/load-store
-//! and Thumb IT-block predication are not modelled (the lifter is stateless).
+//! support intra-instruction p-code branches. Thumb IT blocks are handled via a
+//! `LiftContext` threaded through a contiguous lift: the IT instruction arms the
+//! state and each guarded instruction is predicated branch-free (register writes
+//! committed by select, a guarded unconditional branch becomes conditional).
+//! Guarded stores and conditional compares are not predicated (documented).
 
 use gr_core::address::{Address, Endian, SpaceId};
 use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
 use gr_loader::Memory;
 use smallvec::SmallVec;
 
-use crate::lift::{LiftError, LiftedInstruction, PcodeLift};
+use crate::lift::{ItBlock, LiftContext, LiftError, LiftedInstruction, PcodeLift};
 
 const CONST_SPACE: SpaceId = SpaceId::CONST;
 const RAM_SPACE: SpaceId = SpaceId::RAM;
@@ -1205,6 +1208,87 @@ impl Arm32Lifter {
         }
     }
 
+    /// Branch-free conditional write of an arbitrary-size register: `dst = c ?
+    /// dst : old`, where `dst` already holds the new value.
+    fn emit_cond_select_sized(&self, c: VarnodeData, dst: VarnodeData, old: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
+        let size = dst.size;
+        let push = |ops: &mut Vec<PcodeOp>, s: &mut u32, op: OpCode, out: VarnodeData, ins: &[VarnodeData]| {
+            ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(out), inputs: SmallVec::from_slice(ins) });
+            *s += 1;
+        };
+        let cz = unique(0x780, size);
+        if size == 1 {
+            push(ops, s, OpCode::Copy, cz, &[c]);
+        } else {
+            push(ops, s, OpCode::IntZExt, cz, &[c]);
+        }
+        let mask = unique(0x788, size);
+        push(ops, s, OpCode::Int2Comp, mask, &[cz]);
+        let a = unique(0x790, size);
+        push(ops, s, OpCode::IntAnd, a, &[dst, mask]);
+        let nmask = unique(0x798, size);
+        push(ops, s, OpCode::IntNegate, nmask, &[mask]);
+        let b = unique(0x7A0, size);
+        push(ops, s, OpCode::IntAnd, b, &[old, nmask]);
+        push(ops, s, OpCode::IntOr, dst, &[a, b]);
+    }
+
+    /// Predicate a guarded Thumb instruction's P-code on `cond` (branch-free).
+    /// Register writes are conditionally committed via select; a lone
+    /// unconditional Branch becomes a CBranch. Stores are not guarded (rare in
+    /// IT blocks; documented).
+    fn predicate_thumb(&self, ops: Vec<PcodeOp>, cond: u32, address: u64) -> Vec<PcodeOp> {
+        let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
+
+        // A lone unconditional branch becomes conditional on the IT condition.
+        if ops.len() == 1 && ops[0].opcode == OpCode::Branch {
+            let target = ops[0].inputs[0];
+            let mut out = Vec::new();
+            let mut s = 0u32;
+            let c = self.emit_cond(cond, &mut out, &mut s, address);
+            out.push(PcodeOp { opcode: OpCode::CBranch, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[target, c]) });
+            return out;
+        }
+
+        // Distinct register outputs to predicate (general registers and flags).
+        let mut regs: Vec<VarnodeData> = Vec::new();
+        for op in &ops {
+            if let Some(out) = op.output
+                && out.space == REG_SPACE
+                && !regs.iter().any(|r| r.offset == out.offset && r.size == out.size)
+            {
+                regs.push(out);
+            }
+        }
+        if regs.is_empty() {
+            return ops;
+        }
+
+        let mut out: Vec<PcodeOp> = Vec::new();
+        let mut s = 0u32;
+        // Save the old value of each register that will be written.
+        let mut olds = Vec::new();
+        for (i, r) in regs.iter().enumerate() {
+            let o = unique(0x7C0 + i as u64 * 8, r.size);
+            out.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(o), inputs: SmallVec::from_slice(&[*r]) });
+            s += 1;
+            olds.push(o);
+        }
+        // Original ops, re-stamped to run after the saves.
+        for mut op in ops {
+            op.seq = seq(s);
+            s += 1;
+            out.push(op);
+        }
+        // Evaluate the condition, then select new vs. old for each register.
+        let c = self.emit_cond(cond, &mut out, &mut s, address);
+        for (r, old) in regs.iter().zip(olds.iter()) {
+            self.emit_cond_select_sized(c, *r, *old, &mut out, &mut s, address);
+        }
+        out
+    }
+
     fn disasm_text(&self, bytes: &[u8], address: u64, word: u32) -> String {
         match self.cs.disasm_count(bytes, address, 1) {
             Ok(insns) => insns
@@ -1249,6 +1333,48 @@ impl PcodeLift for Arm32Lifter {
             let mnemonic = self.disasm_text(&buf, address, word);
             Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
         }
+    }
+
+    fn lift_instruction_ctx(&self, memory: &Memory, address: u64, ctx: &mut LiftContext) -> Result<LiftedInstruction, LiftError> {
+        if !self.thumb {
+            return self.lift_instruction(memory, address);
+        }
+
+        // Is this address guarded by an active IT block at the expected point?
+        let guard = match ctx.it {
+            Some(it) if it.addr == address && it.active() => Some(it.current_cond()),
+            _ => None,
+        };
+        // A stale IT state whose address no longer matches means the stream
+        // diverged (random-access lift) — drop it so it can't misapply.
+        if guard.is_none()
+            && let Some(it) = ctx.it
+            && it.addr != address
+        {
+            ctx.it = None;
+        }
+
+        let mut li = self.lift_instruction(memory, address)?;
+
+        // An IT instruction (not itself guarded) sets up the block and emits no
+        // ops: 0b10111111 firstcond mask, with a non-zero mask.
+        if guard.is_none() && li.length == 2 {
+            let b0 = memory.read_byte(address).unwrap_or(0);
+            let b1 = memory.read_byte(address + 1).unwrap_or(0);
+            let hw = self.read_half(b0, b1) as u32;
+            if (hw & 0xFF00) == 0xBF00 && (hw & 0x000F) != 0 {
+                ctx.it = Some(ItBlock { state: (hw & 0xFF) as u8, addr: address + 2 });
+                return Ok(li);
+            }
+        }
+
+        if let Some(cond) = guard {
+            li.ops = self.predicate_thumb(li.ops, cond, address);
+            if let Some(it) = ctx.it {
+                ctx.it = it.advanced().map(|state| ItBlock { state, addr: address + li.length as u64 });
+            }
+        }
+        Ok(li)
     }
 }
 
@@ -1296,6 +1422,17 @@ impl PcodeLift for MappedArmLifter {
         match self.region_at(address) {
             ArmRegion::Thumb => self.thumb.lift_instruction(memory, address),
             _ => self.arm.lift_instruction(memory, address),
+        }
+    }
+
+    fn lift_instruction_ctx(&self, memory: &Memory, address: u64, ctx: &mut LiftContext) -> Result<LiftedInstruction, LiftError> {
+        match self.region_at(address) {
+            ArmRegion::Thumb => self.thumb.lift_instruction_ctx(memory, address, ctx),
+            _ => {
+                // Leaving Thumb code abandons any pending IT state.
+                ctx.it = None;
+                self.arm.lift_instruction_ctx(memory, address, ctx)
+            }
         }
     }
 }
@@ -1775,6 +1912,104 @@ mod tests {
         // address before the first mapping symbol defaults to ARM
         assert_eq!(lifter.region_at(0x1000), ArmRegion::Arm);
         assert_eq!(lifter.region_at(0x2000), ArmRegion::Thumb);
+    }
+
+    #[test]
+    fn it_block_predicates_guarded_instruction() {
+        // it eq          => 0xBF08  (firstcond=EQ=0, mask=1000 => 1 instruction)
+        // moveq r0, #5   => 0x2005  (movs, guarded by EQ)
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xBF08u16.to_le_bytes());
+        bytes.extend_from_slice(&0x2005u16.to_le_bytes());
+        let mut mem = Memory::new(CoreSpace(1), Endian::Little);
+        mem.add_block(MemoryBlock {
+            name: ".text".into(),
+            start: 0x1000,
+            size: bytes.len() as u64,
+            flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
+            data: Some(Arc::from(bytes.as_slice())),
+        });
+        let lifter = Arm32Lifter::new_thumb(Endian::Little);
+        let mut ctx = LiftContext::default();
+
+        // The IT instruction itself emits no ops and arms the block.
+        let it = lifter.lift_instruction_ctx(&mem, 0x1000, &mut ctx).unwrap();
+        assert_eq!(it.length, 2);
+        assert!(it.ops.is_empty());
+        assert!(ctx.it.is_some());
+
+        // The next instruction (movs r0,#5) is predicated on EQ (the Z flag).
+        let guarded = lifter.lift_instruction_ctx(&mem, 0x1002, &mut ctx).unwrap();
+        // Predication saves old r0, runs the copy, evaluates cond, then selects.
+        assert!(guarded.ops.iter().any(|o| o.opcode == OpCode::Int2Comp)); // mask from cond
+        let last = guarded.ops.last().unwrap();
+        assert_eq!(last.opcode, OpCode::IntOr);   // select committed into r0
+        assert_eq!(last.output.unwrap().offset, 0);
+        // Block had one instruction; state cleared afterward.
+        assert!(ctx.it.is_none());
+    }
+
+    #[test]
+    fn it_block_then_else_conditions() {
+        // ite eq : firstcond=EQ(0), mask=1100 => 2 insns (then EQ, else NE)
+        // hw = 0xBF0C
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xBF0Cu16.to_le_bytes());
+        bytes.extend_from_slice(&0x2001u16.to_le_bytes()); // movs r0,#1 (then, EQ)
+        bytes.extend_from_slice(&0x2002u16.to_le_bytes()); // movs r0,#2 (else, NE)
+        let mut mem = Memory::new(CoreSpace(1), Endian::Little);
+        mem.add_block(MemoryBlock {
+            name: ".text".into(),
+            start: 0x2000,
+            size: bytes.len() as u64,
+            flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
+            data: Some(Arc::from(bytes.as_slice())),
+        });
+        let lifter = Arm32Lifter::new_thumb(Endian::Little);
+        let mut ctx = LiftContext::default();
+        lifter.lift_instruction_ctx(&mem, 0x2000, &mut ctx).unwrap(); // ITE
+        // First guarded instruction uses EQ (cond 0).
+        assert_eq!(ctx.it.unwrap().current_cond(), 0x0);
+        lifter.lift_instruction_ctx(&mem, 0x2002, &mut ctx).unwrap();
+        // Second guarded instruction uses NE (cond 1, EQ inverted).
+        assert_eq!(ctx.it.unwrap().current_cond(), 0x1);
+        lifter.lift_instruction_ctx(&mem, 0x2004, &mut ctx).unwrap();
+        assert!(ctx.it.is_none());
+    }
+
+    #[test]
+    fn it_state_advance_matches_arm_spec() {
+        // ITT EQ: state 0x04 -> after one insn 0x08 -> end.
+        let s0 = ItBlock { state: 0x04, addr: 0 };
+        assert_eq!(s0.current_cond(), 0x0);
+        assert_eq!(s0.advanced(), Some(0x08));
+        let s1 = ItBlock { state: 0x08, addr: 0 };
+        assert_eq!(s1.advanced(), None);
+        // ITE EQ: 0x0C -> 0x18 (cond becomes NE).
+        let e0 = ItBlock { state: 0x0C, addr: 0 };
+        assert_eq!(e0.advanced(), Some(0x18));
+        assert_eq!((0x18u8 >> 4) & 0xF, 0x1);
+    }
+
+    #[test]
+    fn it_stale_state_ignored_on_address_mismatch() {
+        // Arm IT for address 0x1002, then lift at a different address: no panic,
+        // state dropped, instruction lifted unpredicated.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x2005u16.to_le_bytes());
+        let mut mem = Memory::new(CoreSpace(1), Endian::Little);
+        mem.add_block(MemoryBlock {
+            name: ".text".into(),
+            start: 0x4000,
+            size: bytes.len() as u64,
+            flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
+            data: Some(Arc::from(bytes.as_slice())),
+        });
+        let lifter = Arm32Lifter::new_thumb(Endian::Little);
+        let mut ctx = LiftContext { it: Some(ItBlock { state: 0x08, addr: 0x1002 }) };
+        let li = lifter.lift_instruction_ctx(&mem, 0x4000, &mut ctx).unwrap();
+        assert_eq!(li.ops[0].opcode, OpCode::Copy); // plain movs, not predicated
+        assert!(ctx.it.is_none());
     }
 
     #[test]

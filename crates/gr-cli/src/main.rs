@@ -11,7 +11,7 @@ use gr_lift::ppc::PpcLifter;
 use gr_lift::riscv::RiscVLifter;
 use gr_lift::sparc::SparcLifter;
 use gr_lift::x86::X86Lifter;
-use gr_lift::PcodeLift;
+use gr_lift::{LiftContext, PcodeLift};
 use gr_loader::{BinaryLoader, Memory, SectionFlags, SymbolKind};
 use gr_program::{Program, ProgramDiff, ProjectSummary};
 
@@ -869,13 +869,14 @@ fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u
 
     let mut addr = entry;
     let mut total_steps = 0u64;
+    let mut lift_ctx = LiftContext::default();
 
     while total_steps < max_steps {
         if bp_mgr.check(addr) {
             println!("  ** Breakpoint hit at 0x{:x} **", addr);
             break;
         }
-        let lifted = match lifter.lift_instruction(&info.memory, addr) {
+        let lifted = match lifter.lift_instruction_ctx(&info.memory, addr, &mut lift_ctx) {
             Ok(l) => l,
             Err(e) => { println!("  [0x{:x}] decode error: {}", addr, e); break; }
         };
@@ -911,6 +912,7 @@ struct EmulatorTarget {
     pc: u64,
     breakpoints: std::collections::BTreeSet<u64>,
     exited: bool,
+    lift_ctx: LiftContext,
 }
 
 impl EmulatorTarget {
@@ -921,7 +923,7 @@ impl EmulatorTarget {
         if self.exited {
             return gr_emulator::StopReason::Exited(0);
         }
-        let lifted = match self.lifter.lift_instruction(&self.memory, self.pc) {
+        let lifted = match self.lifter.lift_instruction_ctx(&self.memory, self.pc, &mut self.lift_ctx) {
             Ok(l) => l,
             Err(_) => {
                 self.exited = true;
@@ -992,6 +994,7 @@ fn build_emulator_target(
         pc: entry,
         breakpoints: std::collections::BTreeSet::new(),
         exited: false,
+        lift_ctx: LiftContext::default(),
     })
 }
 
