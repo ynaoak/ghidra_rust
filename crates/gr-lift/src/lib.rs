@@ -4,6 +4,7 @@ pub mod lift;
 pub mod mips;
 pub mod ppc;
 pub mod riscv;
+pub mod sparc;
 pub mod x86;
 
 pub use lift::{LiftedInstruction, PcodeLift};

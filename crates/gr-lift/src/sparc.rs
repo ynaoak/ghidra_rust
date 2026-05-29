@@ -1,0 +1,563 @@
+//! SPARC V8 (32-bit) → P-code lifter.
+//!
+//! Decodes the common SPARC formats directly into P-code: SETHI, integer
+//! arithmetic/logical (register and simm13), shifts, multiply/divide,
+//! load/store, integer compares/cc into a simplified icc, CALL, Bicc
+//! conditional branches, and JMPL (call/return/indirect). Capstone supplies the
+//! disassembly text. SPARC is big-endian with fixed 4-byte instructions; `%g0`
+//! reads as 0 and discards writes.
+//!
+//! Simplifications: branch delay slots are not reordered (each instruction is
+//! lifted independently); SAVE/RESTORE model only the pointer arithmetic, not
+//! the register-window rotation; the carry-in of ADDX/SUBX is ignored.
+
+use gr_core::address::{Address, SpaceId};
+use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
+use gr_loader::Memory;
+use smallvec::SmallVec;
+
+use crate::lift::{LiftError, LiftedInstruction, PcodeLift};
+
+const CONST_SPACE: SpaceId = SpaceId::CONST;
+const RAM_SPACE: SpaceId = SpaceId::RAM;
+const REG_SPACE: SpaceId = SpaceId::REGISTER;
+const UNIQUE_SPACE: SpaceId = SpaceId::UNIQUE;
+
+const O7_INDEX: u32 = 15; // link register for calls
+const I7_INDEX: u32 = 31; // return address register
+
+// Simplified integer condition codes (icc), one byte each.
+const ICC_N: u64 = 0x200;
+const ICC_Z: u64 = 0x201;
+const ICC_V: u64 = 0x202;
+const ICC_C: u64 = 0x203;
+
+fn constant(value: u64, size: u32) -> VarnodeData {
+    VarnodeData::new(CONST_SPACE, value, size)
+}
+
+fn ram(addr: u64) -> VarnodeData {
+    VarnodeData::new(RAM_SPACE, addr, 4)
+}
+
+fn unique(offset: u64, size: u32) -> VarnodeData {
+    VarnodeData::new(UNIQUE_SPACE, offset, size)
+}
+
+fn reg(n: u32) -> VarnodeData {
+    VarnodeData::new(REG_SPACE, n as u64 * 4, 4)
+}
+
+fn flag(off: u64) -> VarnodeData {
+    VarnodeData::new(REG_SPACE, off, 1)
+}
+
+/// Source operand: `%g0` (r0) reads as the literal 0.
+fn rs(n: u32) -> VarnodeData {
+    if n == 0 { constant(0, 4) } else { reg(n) }
+}
+
+/// Destination: writes to `%g0` (r0) are discarded.
+fn rd_out(n: u32) -> Option<VarnodeData> {
+    if n == 0 { None } else { Some(reg(n)) }
+}
+
+pub struct SparcLifter {
+    cs: capstone::Capstone,
+}
+
+unsafe impl Send for SparcLifter {}
+unsafe impl Sync for SparcLifter {}
+
+impl SparcLifter {
+    pub fn new_32() -> Self {
+        use capstone::prelude::*;
+        let cs = Capstone::new()
+            .sparc()
+            .mode(arch::sparc::ArchMode::Default)
+            .build()
+            .expect("failed to create SPARC capstone");
+        Self { cs }
+    }
+
+    fn lift_word(&self, word: u32, address: u64) -> Vec<PcodeOp> {
+        let mut ops: Vec<PcodeOp> = Vec::new();
+        let mut s = 0u32;
+        let op = word >> 30;
+
+        match op {
+            1 => {
+                // CALL: target = pc + disp30*4; %o7 = pc (return address).
+                let disp30 = word & 0x3FFF_FFFF;
+                let target = address.wrapping_add((disp30 << 2) as u64) & 0xFFFF_FFFF;
+                self.push(&mut ops, &mut s, OpCode::Copy, Some(reg(O7_INDEX)), &[constant(address & 0xFFFF_FFFF, 4)], address);
+                self.push(&mut ops, &mut s, OpCode::Call, None, &[ram(target)], address);
+            }
+            0 => self.lift_format2(word, address, &mut ops, &mut s),
+            2 => self.lift_format3_alu(word, address, &mut ops, &mut s),
+            3 => self.lift_format3_mem(word, address, &mut ops, &mut s),
+            _ => {}
+        }
+        ops
+    }
+
+    fn lift_format2(&self, word: u32, address: u64, ops: &mut Vec<PcodeOp>, s: &mut u32) {
+        let op2 = (word >> 22) & 0x7;
+        match op2 {
+            4 => {
+                // SETHI rd, imm22 : rd = imm22 << 10  (sethi %g0,0 = nop)
+                let rd = (word >> 25) & 0x1F;
+                let imm22 = word & 0x3F_FFFF;
+                if let Some(out) = rd_out(rd) {
+                    self.push(ops, s, OpCode::Copy, Some(out), &[constant((imm22 << 10) as u64, 4)], address);
+                }
+            }
+            2 => {
+                // Bicc: integer conditional branch.
+                let cond = (word >> 25) & 0xF;
+                let disp22 = ((word & 0x3F_FFFF) << 10) as i32 >> 10; // sign-extend 22 bits
+                let target = address.wrapping_add((disp22 << 2) as i64 as u64) & 0xFFFF_FFFF;
+                match cond {
+                    0x0 => {} // BN: branch never
+                    0x8 => self.push(ops, s, OpCode::Branch, None, &[ram(target)], address), // BA
+                    _ => {
+                        if let Some(c) = self.emit_cond(cond, ops, s, address) {
+                            self.push(ops, s, OpCode::CBranch, None, &[ram(target), c], address);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn lift_format3_alu(&self, word: u32, address: u64, ops: &mut Vec<PcodeOp>, s: &mut u32) {
+        let op3 = (word >> 19) & 0x3F;
+        let rd = (word >> 25) & 0x1F;
+        let rs1 = (word >> 14) & 0x1F;
+        let i = (word >> 13) & 1 == 1;
+        let b = if i {
+            constant(((word & 0x1FFF) << 19) as i32 as i64 as u64 >> 19 & 0xFFFF_FFFF, 4)
+        } else {
+            rs(word & 0x1F)
+        };
+        let a = rs(rs1);
+
+        match op3 {
+            0x38 => {
+                // JMPL: target = rs1 + b; rd = pc (link).
+                let target = unique(0x500, 4);
+                self.push(ops, s, OpCode::IntAdd, Some(target), &[a, b], address);
+                if let Some(out) = rd_out(rd) {
+                    self.push(ops, s, OpCode::Copy, Some(out), &[constant(address & 0xFFFF_FFFF, 4)], address);
+                }
+                if rd == 0 && (rs1 == I7_INDEX || rs1 == O7_INDEX) {
+                    self.push(ops, s, OpCode::Return, None, &[target], address);
+                } else if rd == O7_INDEX {
+                    self.push(ops, s, OpCode::CallInd, None, &[target], address);
+                } else {
+                    self.push(ops, s, OpCode::BranchInd, None, &[target], address);
+                }
+            }
+            0x3C | 0x3D => {
+                // SAVE / RESTORE: model only rd = rs1 + b (ignore window rotation).
+                if let Some(out) = rd_out(rd) {
+                    self.push(ops, s, OpCode::IntAdd, Some(out), &[a, b], address);
+                }
+            }
+            0x25 => self.alu_simple(OpCode::IntLeft, rd, a, b, ops, s, address),   // SLL
+            0x26 => self.alu_simple(OpCode::IntRight, rd, a, b, ops, s, address),  // SRL
+            0x27 => self.alu_simple(OpCode::IntSRight, rd, a, b, ops, s, address), // SRA
+            _ if op3 < 0x20 => {
+                let base = op3 & 0xF;
+                let cc = op3 & 0x10 != 0;
+                self.alu_base(base, cc, rd, a, b, ops, s, address);
+            }
+            _ => {}
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn alu_base(&self, base: u32, cc: bool, rd: u32, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        // Compute the result into a temp so flags can read it even when rd=%g0.
+        let res = unique(0x510, 4);
+        match base {
+            0x0 | 0x8 => self.push(ops, s, OpCode::IntAdd, Some(res), &[a, b], address),  // ADD / ADDX
+            0x4 | 0xC => self.push(ops, s, OpCode::IntSub, Some(res), &[a, b], address),  // SUB / SUBX
+            0x1 => self.push(ops, s, OpCode::IntAnd, Some(res), &[a, b], address),        // AND
+            0x2 => self.push(ops, s, OpCode::IntOr, Some(res), &[a, b], address),         // OR
+            0x3 => self.push(ops, s, OpCode::IntXor, Some(res), &[a, b], address),        // XOR
+            0x5 => self.alu_with_not(OpCode::IntAnd, res, a, b, ops, s, address),         // ANDN
+            0x6 => self.alu_with_not(OpCode::IntOr, res, a, b, ops, s, address),          // ORN
+            0x7 => {                                                                       // XNOR
+                let t = unique(0x518, 4);
+                self.push(ops, s, OpCode::IntXor, Some(t), &[a, b], address);
+                self.push(ops, s, OpCode::IntNegate, Some(res), &[t], address);
+            }
+            0xA | 0xB => self.push(ops, s, OpCode::IntMult, Some(res), &[a, b], address), // UMUL / SMUL
+            0xE => self.push(ops, s, OpCode::IntDiv, Some(res), &[a, b], address),        // UDIV
+            0xF => self.push(ops, s, OpCode::IntSDiv, Some(res), &[a, b], address),       // SDIV
+            _ => return,
+        }
+        if cc {
+            let is_add = matches!(base, 0x0 | 0x8);
+            let is_sub = matches!(base, 0x4 | 0xC);
+            self.set_flags(a, b, res, is_add, is_sub, ops, s, address);
+        }
+        if let Some(out) = rd_out(rd) {
+            self.push(ops, s, OpCode::Copy, Some(out), &[res], address);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn alu_with_not(&self, op: OpCode, res: VarnodeData, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let nb = unique(0x520, 4);
+        self.push(ops, s, OpCode::IntNegate, Some(nb), &[b], address);
+        self.push(ops, s, op, Some(res), &[a, nb], address);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn alu_simple(&self, op: OpCode, rd: u32, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        if let Some(out) = rd_out(rd) {
+            self.push(ops, s, op, Some(out), &[a, b], address);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_flags(&self, a: VarnodeData, b: VarnodeData, res: VarnodeData, is_add: bool, is_sub: bool, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        // Z = res == 0 ; N = res <s 0
+        self.push(ops, s, OpCode::IntEqual, Some(flag(ICC_Z)), &[res, constant(0, 4)], address);
+        self.push(ops, s, OpCode::IntSLess, Some(flag(ICC_N)), &[res, constant(0, 4)], address);
+        if is_sub {
+            // C = borrow = a <u b ; V = signed borrow
+            self.push(ops, s, OpCode::IntLess, Some(flag(ICC_C)), &[a, b], address);
+            self.push(ops, s, OpCode::IntSBorrow, Some(flag(ICC_V)), &[a, b], address);
+        } else if is_add {
+            // C = unsigned carry ; V = signed carry
+            self.push(ops, s, OpCode::IntCarry, Some(flag(ICC_C)), &[a, b], address);
+            self.push(ops, s, OpCode::IntSCarry, Some(flag(ICC_V)), &[a, b], address);
+        } else {
+            // Logical: C and V cleared.
+            self.push(ops, s, OpCode::Copy, Some(flag(ICC_C)), &[constant(0, 1)], address);
+            self.push(ops, s, OpCode::Copy, Some(flag(ICC_V)), &[constant(0, 1)], address);
+        }
+    }
+
+    fn lift_format3_mem(&self, word: u32, address: u64, ops: &mut Vec<PcodeOp>, s: &mut u32) {
+        let op3 = (word >> 19) & 0x3F;
+        let rd = (word >> 25) & 0x1F;
+        let rs1 = (word >> 14) & 0x1F;
+        let i = (word >> 13) & 1 == 1;
+        let off = if i {
+            constant(((word & 0x1FFF) << 19) as i32 as i64 as u64 >> 19 & 0xFFFF_FFFF, 4)
+        } else {
+            rs(word & 0x1F)
+        };
+        let ea = unique(0x600, 4);
+        self.push(ops, s, OpCode::IntAdd, Some(ea), &[rs(rs1), off], address);
+
+        match op3 {
+            0x00 => self.emit_load(rd, ea, 4, false, ops, s, address), // LD
+            0x01 => self.emit_load(rd, ea, 1, false, ops, s, address), // LDUB
+            0x02 => self.emit_load(rd, ea, 2, false, ops, s, address), // LDUH
+            0x09 => self.emit_load(rd, ea, 1, true, ops, s, address),  // LDSB
+            0x0A => self.emit_load(rd, ea, 2, true, ops, s, address),  // LDSH
+            0x04 => self.emit_store(rd, ea, 4, ops, s, address),       // ST
+            0x05 => self.emit_store(rd, ea, 1, ops, s, address),       // STB
+            0x06 => self.emit_store(rd, ea, 2, ops, s, address),       // STH
+            _ => {}
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_load(&self, rd: u32, ea: VarnodeData, size: u32, signed: bool, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let Some(out) = rd_out(rd) else { return };
+        if size == 4 {
+            self.push(ops, s, OpCode::Load, Some(out), &[constant(RAM_SPACE.0 as u64, 4), ea], address);
+        } else {
+            let loaded = unique(0x610, size);
+            self.push(ops, s, OpCode::Load, Some(loaded), &[constant(RAM_SPACE.0 as u64, 4), ea], address);
+            let ext = if signed { OpCode::IntSExt } else { OpCode::IntZExt };
+            self.push(ops, s, ext, Some(out), &[loaded], address);
+        }
+    }
+
+    fn emit_store(&self, rd: u32, ea: VarnodeData, size: u32, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let value = if size == 4 {
+            rs(rd)
+        } else if rd == 0 {
+            constant(0, size)
+        } else {
+            VarnodeData::new(REG_SPACE, rd as u64 * 4, size)
+        };
+        self.push(ops, s, OpCode::Store, None, &[constant(RAM_SPACE.0 as u64, 4), ea, value], address);
+    }
+
+    /// Build the branch condition for a Bicc cond field (icc-based). Returns
+    /// `None` for "branch never" (cond 0); "branch always" is handled by caller.
+    fn emit_cond(&self, cond: u32, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) -> Option<VarnodeData> {
+        let n = flag(ICC_N);
+        let z = flag(ICC_Z);
+        let v = flag(ICC_V);
+        let c = flag(ICC_C);
+        let not = |ops: &mut Vec<PcodeOp>, s: &mut u32, x: VarnodeData, addr: u64| -> VarnodeData {
+            let t = unique(0x700 + *s as u64 * 2, 1);
+            ops.push(PcodeOp { opcode: OpCode::BoolNegate, seq: SeqNum::new(Address::new(RAM_SPACE, addr), *s), output: Some(t), inputs: SmallVec::from_slice(&[x]) });
+            *s += 1;
+            t
+        };
+        let bin = |ops: &mut Vec<PcodeOp>, s: &mut u32, op: OpCode, x: VarnodeData, y: VarnodeData, addr: u64| -> VarnodeData {
+            let t = unique(0x720 + *s as u64 * 2, 1);
+            ops.push(PcodeOp { opcode: op, seq: SeqNum::new(Address::new(RAM_SPACE, addr), *s), output: Some(t), inputs: SmallVec::from_slice(&[x, y]) });
+            *s += 1;
+            t
+        };
+        let r = match cond {
+            0x1 => z,                                              // BE
+            0x9 => not(ops, s, z, address),                        // BNE
+            0x5 => c,                                              // BCS / BLU
+            0xD => not(ops, s, c, address),                        // BCC / BGEU
+            0x6 => n,                                              // BNEG
+            0xE => not(ops, s, n, address),                        // BPOS
+            0x7 => v,                                              // BVS
+            0xF => not(ops, s, v, address),                        // BVC
+            0x3 => bin(ops, s, OpCode::IntXor, n, v, address),     // BL:  N^V
+            0xB => { let nv = bin(ops, s, OpCode::IntXor, n, v, address); not(ops, s, nv, address) } // BGE
+            0x2 => { let nv = bin(ops, s, OpCode::IntXor, n, v, address); bin(ops, s, OpCode::BoolOr, z, nv, address) } // BLE
+            0xA => { let nv = bin(ops, s, OpCode::IntXor, n, v, address); let le = bin(ops, s, OpCode::BoolOr, z, nv, address); not(ops, s, le, address) } // BG
+            0x4 => bin(ops, s, OpCode::BoolOr, c, z, address),     // BLEU: C|Z
+            0xC => { let cz = bin(ops, s, OpCode::BoolOr, c, z, address); not(ops, s, cz, address) } // BGU
+            _ => return None,
+        };
+        Some(r)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(&self, ops: &mut Vec<PcodeOp>, s: &mut u32, op: OpCode, out: Option<VarnodeData>, ins: &[VarnodeData], address: u64) {
+        ops.push(PcodeOp {
+            opcode: op,
+            seq: SeqNum::new(Address::new(RAM_SPACE, address), *s),
+            output: out,
+            inputs: SmallVec::from_slice(ins),
+        });
+        *s += 1;
+    }
+
+    fn disasm_text(&self, bytes: &[u8], address: u64, word: u32) -> String {
+        match self.cs.disasm_count(bytes, address, 1) {
+            Ok(insns) => insns
+                .iter()
+                .next()
+                .map(|insn| {
+                    let m = insn.mnemonic().unwrap_or("???");
+                    let o = insn.op_str().unwrap_or("");
+                    if o.is_empty() { m.to_string() } else { format!("{} {}", m, o) }
+                })
+                .unwrap_or_else(|| format!(".word 0x{:08x}", word)),
+            Err(_) => format!(".word 0x{:08x}", word),
+        }
+    }
+}
+
+impl PcodeLift for SparcLifter {
+    fn lift_instruction(&self, memory: &Memory, address: u64) -> Result<LiftedInstruction, LiftError> {
+        let mut buf = [0u8; 4];
+        memory
+            .read_bytes(address, &mut buf)
+            .map_err(|_| LiftError::UnreadableAddress(address))?;
+        let word = u32::from_be_bytes(buf); // SPARC is big-endian
+        let ops = self.lift_word(word, address);
+        let mnemonic = self.disasm_text(&buf, address, word);
+        Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gr_core::address::Endian;
+    use gr_core::address::SpaceId as CoreSpace;
+    use gr_loader::memory::{MemoryBlock, MemoryFlags};
+    use std::sync::Arc;
+
+    fn make_memory(word: u32, addr: u64) -> Memory {
+        let bytes = word.to_be_bytes();
+        let mut mem = Memory::new(CoreSpace(1), Endian::Big);
+        mem.add_block(MemoryBlock {
+            name: ".text".into(),
+            start: addr,
+            size: 4,
+            flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
+            data: Some(Arc::from(bytes.as_slice())),
+        });
+        mem
+    }
+
+    fn lift(word: u32) -> Vec<PcodeOp> {
+        let lifter = SparcLifter::new_32();
+        let mem = make_memory(word, 0x1000);
+        lifter.lift_instruction(&mem, 0x1000).unwrap().ops
+    }
+
+    // Format-3 ALU encoder: op=2, op3, rd, rs1, i, rs2/simm13.
+    fn f3(op3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+        (2 << 30) | (rd << 25) | (op3 << 19) | (rs1 << 14) | rs2
+    }
+    fn f3i(op3: u32, rd: u32, rs1: u32, simm13: u32) -> u32 {
+        (2 << 30) | (rd << 25) | (op3 << 19) | (rs1 << 14) | (1 << 13) | (simm13 & 0x1FFF)
+    }
+
+    #[test]
+    fn lift_add_reg() {
+        // add %o0, %o1, %o2  -> rd=o2(10), rs1=o0(8), rs2=o1(9), op3=0
+        let ops = lift(f3(0x00, 10, 8, 9));
+        assert_eq!(ops[0].opcode, OpCode::IntAdd);
+        assert_eq!(ops[0].inputs[0].offset, 8 * 4);
+        assert_eq!(ops[0].inputs[1].offset, 9 * 4);
+        // result copied to o2
+        let last = ops.last().unwrap();
+        assert_eq!(last.output.unwrap().offset, 10 * 4);
+    }
+
+    #[test]
+    fn lift_add_imm() {
+        // add %o0, 1, %o0  (inc)  rd=8 rs1=8 simm=1
+        let ops = lift(f3i(0x00, 8, 8, 1));
+        assert_eq!(ops[0].opcode, OpCode::IntAdd);
+        assert_eq!(ops[0].inputs[1].space, CoreSpace::CONST);
+        assert_eq!(ops[0].inputs[1].offset, 1);
+    }
+
+    #[test]
+    fn lift_add_imm_negative() {
+        // add %o0, -1, %o0  : simm13 = 0x1FFF (-1)
+        let ops = lift(f3i(0x00, 8, 8, 0x1FFF));
+        assert_eq!(ops[0].inputs[1].offset, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn lift_g0_write_discarded() {
+        // add %o0, %o1, %g0 : rd=0 -> no register written
+        let ops = lift(f3(0x00, 0, 8, 9));
+        // add computes into a temp but nothing copies to a register
+        assert!(!ops.iter().any(|o| o.output.map(|v| v.space == CoreSpace::REGISTER && v.offset < 0x200).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_or_g0_is_mov() {
+        // or %g0, %o1, %o0  (mov %o1, %o0): rs1=0 reads as const 0
+        let ops = lift(f3(0x02, 8, 0, 9));
+        assert_eq!(ops[0].opcode, OpCode::IntOr);
+        assert_eq!(ops[0].inputs[0].space, CoreSpace::CONST);
+        assert_eq!(ops[0].inputs[0].offset, 0);
+    }
+
+    #[test]
+    fn lift_andn() {
+        // andn %o0, %o1, %o2 : op3=0x05 -> negate then and
+        let ops = lift(f3(0x05, 10, 8, 9));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntNegate));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntAnd));
+    }
+
+    #[test]
+    fn lift_subcc_sets_flags() {
+        // subcc %o0, %o1, %g0  (cmp %o0,%o1): op3=0x14, rd=0
+        let ops = lift(f3(0x14, 0, 8, 9));
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == ICC_Z).unwrap_or(false)));
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == ICC_C).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_sll() {
+        // sll %o0, 2, %o1 : op3=0x25
+        let ops = lift(f3i(0x25, 9, 8, 2));
+        assert_eq!(ops[0].opcode, OpCode::IntLeft);
+        assert_eq!(ops[0].output.unwrap().offset, 9 * 4);
+    }
+
+    #[test]
+    fn lift_sethi() {
+        // sethi 0x3FFFFF, %o0 : op=0, op2=4, rd=8
+        let word = (8 << 25) | (4 << 22) | 0x3F_FFFF;
+        let ops = lift(word);
+        assert_eq!(ops[0].opcode, OpCode::Copy);
+        assert_eq!(ops[0].inputs[0].offset, (0x3F_FFFF << 10) & 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn lift_nop_is_empty() {
+        // nop = sethi %g0, 0  (rd=0) -> discarded
+        let word = 4 << 22;
+        let ops = lift(word);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn lift_ld() {
+        // ld [%o0 + 4], %o1 : op=3 op3=0x00 rd=9 rs1=8 simm=4
+        let word = (3 << 30) | (9 << 25) | (8 << 14) | (1 << 13) | 4;
+        let ops = lift(word);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntAdd)); // ea
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Load));
+    }
+
+    #[test]
+    fn lift_ldub_zero_extends() {
+        // ldub [%o0], %o1 : op=3 op3=0x01
+        let word = (3 << 30) | (9 << 25) | (0x01 << 19) | (8 << 14);
+        let ops = lift(word);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntZExt));
+    }
+
+    #[test]
+    fn lift_st() {
+        // st %o1, [%o0] : op=3 op3=0x04 rd=9(src) rs1=8
+        let word = (3 << 30) | (9 << 25) | (0x04 << 19) | (8 << 14);
+        let ops = lift(word);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Store));
+    }
+
+    #[test]
+    fn lift_call() {
+        // call +0x40 : op=1 disp30=0x10  -> target = 0x1000 + 0x40
+        let word = (1 << 30) | 0x10;
+        let ops = lift(word);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Copy && o.output.map(|v| v.offset == O7_INDEX as u64 * 4).unwrap_or(false)));
+        let call = ops.iter().find(|o| o.opcode == OpCode::Call).unwrap();
+        assert_eq!(call.inputs[0].offset, 0x1040);
+    }
+
+    #[test]
+    fn lift_ba() {
+        // ba +8 : op=0 op2=2 cond=8 disp22=2
+        let word = (8 << 25) | (2 << 22) | 2;
+        let ops = lift(word);
+        assert_eq!(ops[0].opcode, OpCode::Branch);
+        assert_eq!(ops[0].inputs[0].offset, 0x1008);
+    }
+
+    #[test]
+    fn lift_be_conditional() {
+        // be +8 : op=0 op2=2 cond=1(BE) disp22=2
+        let word = (1 << 25) | (2 << 22) | 2;
+        let ops = lift(word);
+        let cbr = ops.iter().find(|o| o.opcode == OpCode::CBranch).unwrap();
+        assert_eq!(cbr.inputs[0].offset, 0x1008);
+        assert_eq!(cbr.inputs[1].offset, ICC_Z);
+    }
+
+    #[test]
+    fn lift_jmpl_ret() {
+        // ret = jmpl %i7 + 8, %g0 : op=2 op3=0x38 rd=0 rs1=31 simm=8
+        let ops = lift(f3i(0x38, 0, I7_INDEX, 8));
+        assert_eq!(ops.last().unwrap().opcode, OpCode::Return);
+    }
+
+    #[test]
+    fn lift_jmpl_indirect_call() {
+        // jmpl %o0, %o7 : op=2 op3=0x38 rd=15(o7) rs1=8
+        let ops = lift(f3(0x38, O7_INDEX, 8, 0));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::CallInd));
+    }
+}

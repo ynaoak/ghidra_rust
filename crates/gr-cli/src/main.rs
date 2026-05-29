@@ -9,6 +9,7 @@ use gr_lift::arm32::{Arm32Lifter, ArmRegion, MappedArmLifter};
 use gr_lift::mips::MipsLifter;
 use gr_lift::ppc::PpcLifter;
 use gr_lift::riscv::RiscVLifter;
+use gr_lift::sparc::SparcLifter;
 use gr_lift::x86::X86Lifter;
 use gr_lift::PcodeLift;
 use gr_loader::{BinaryLoader, Memory, SectionFlags, SymbolKind};
@@ -535,6 +536,7 @@ fn create_lifter(
         gr_loader::Architecture::Mips => Some(Box::new(MipsLifter::new_32(endian))),
         gr_loader::Architecture::Riscv32 => Some(Box::new(RiscVLifter::new_rv32())),
         gr_loader::Architecture::PowerPc => Some(Box::new(PpcLifter::new_32(endian))),
+        gr_loader::Architecture::Sparc => Some(Box::new(SparcLifter::new_32())),
         _ => None,
     }
 }
