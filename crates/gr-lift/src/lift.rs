@@ -32,6 +32,20 @@ pub trait PcodeLift: Send + Sync {
         address: u64,
     ) -> Result<LiftedInstruction, LiftError>;
 
+    /// Context-aware lift. The default ignores `ctx` and calls
+    /// [`PcodeLift::lift_instruction`]. Lifters with cross-instruction decode
+    /// state (e.g. ARM Thumb IT blocks) override this; consumers lifting a
+    /// contiguous stream should call it with a `LiftContext` persisted across
+    /// the stream.
+    fn lift_instruction_ctx(
+        &self,
+        memory: &Memory,
+        address: u64,
+        _ctx: &mut LiftContext,
+    ) -> Result<LiftedInstruction, LiftError> {
+        self.lift_instruction(memory, address)
+    }
+
     fn lift_range(
         &self,
         memory: &Memory,
@@ -40,8 +54,9 @@ pub trait PcodeLift: Send + Sync {
     ) -> Result<Vec<LiftedInstruction>, LiftError> {
         let mut results = Vec::new();
         let mut addr = start;
+        let mut ctx = LiftContext::default();
         for _ in 0..count {
-            match self.lift_instruction(memory, addr) {
+            match self.lift_instruction_ctx(memory, addr, &mut ctx) {
                 Ok(lifted) => {
                     addr += lifted.length as u64;
                     results.push(lifted);
@@ -50,6 +65,63 @@ pub trait PcodeLift: Send + Sync {
             }
         }
         Ok(results)
+    }
+}
+
+/// Cross-instruction decode state threaded through a contiguous lift. Reset at
+/// the start of each independent instruction stream. Carries the ARM Thumb
+/// IT-block state and a pending SPARC delay-slot control transfer; the
+/// per-instruction lifter validates each against the expected address so
+/// random-access lifting never misapplies stale state.
+#[derive(Debug, Default, Clone)]
+pub struct LiftContext {
+    pub it: Option<ItBlock>,
+    pub delay: Option<DelaySlot>,
+}
+
+/// A control-transfer P-code op deferred to the following (delay-slot)
+/// instruction, used to model SPARC's branch delay slots: the transfer is
+/// appended after the delay-slot instruction's own effects.
+#[derive(Debug, Clone)]
+pub struct DelaySlot {
+    /// The control-transfer op to emit after the delay-slot instruction.
+    pub op: PcodeOp,
+    /// Address of the delay-slot instruction this transfer follows.
+    pub addr: u64,
+    /// For an annulling conditional branch the delay slot executes only when
+    /// the branch is taken, so its register writes are predicated on the
+    /// branch condition (`op.inputs[1]`).
+    pub annul: bool,
+}
+
+/// ARM Thumb IT (If-Then) block state.
+#[derive(Debug, Clone, Copy)]
+pub struct ItBlock {
+    /// 8-bit ITSTATE (`firstcond:mask`), advanced after each guarded instruction.
+    pub state: u8,
+    /// Address the current `state` applies to.
+    pub addr: u64,
+}
+
+impl ItBlock {
+    /// The condition code (0-15) guarding the current instruction.
+    pub fn current_cond(&self) -> u32 {
+        (self.state >> 4) as u32 & 0xF
+    }
+
+    /// Whether an instruction is still being guarded (mask not exhausted).
+    pub fn active(&self) -> bool {
+        self.state & 0x0F != 0
+    }
+
+    /// Advance ITSTATE after a guarded instruction. Returns the next state, or
+    /// `None` when the block has ended.
+    pub fn advanced(self) -> Option<u8> {
+        if self.state & 0x07 == 0 {
+            None
+        } else {
+            Some((self.state & 0xE0) | ((self.state << 1) & 0x1F))
+        }
     }
 }
 

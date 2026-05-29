@@ -2,15 +2,25 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use gr_analysis::{AnalysisManager, CallGraph};
-use gr_arch::arch::create_architecture;
+use gr_analysis::strings::{find_strings, is_data_section};
+use gr_arch::arch::{create_architecture, create_architecture_with_options};
+use gr_lift::aarch64::Aarch64Lifter;
+use gr_lift::arm32::{Arm32Lifter, ArmRegion, MappedArmLifter};
+use gr_lift::mips::MipsLifter;
+use gr_lift::ppc::PpcLifter;
+use gr_lift::riscv::RiscVLifter;
+use gr_lift::sparc::SparcLifter;
 use gr_lift::x86::X86Lifter;
-use gr_lift::PcodeLift;
-use gr_loader::{BinaryLoader, SymbolKind};
-use gr_program::{Program, ProjectSummary};
+use gr_lift::{LiftContext, PcodeLift};
+use gr_loader::{BinaryLoader, Memory, SectionFlags, SymbolKind};
+use gr_program::{Program, ProgramDiff, ProjectSummary};
 
 #[derive(Parser)]
 #[command(name = "ghidra-rust", version, about = "Binary analysis tool powered by ghidra-rust")]
 struct Cli {
+    /// Decode ARM code in Thumb (T16/T32) mode instead of A32
+    #[arg(long, global = true)]
+    thumb: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -88,7 +98,7 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "16")]
         count: usize,
     },
-    /// Decompile a function to C pseudocode
+    /// Decompile a function to pseudocode
     Decompile {
         /// Path to the binary file
         file: PathBuf,
@@ -98,6 +108,20 @@ enum Commands {
         /// Show SSA dump instead of C output
         #[arg(long)]
         ssa: bool,
+        /// Output Rust-style pseudocode instead of C
+        #[arg(long)]
+        rust: bool,
+    },
+    /// Taint analysis: track parameters to dangerous sinks
+    Taint {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Function address (hex). Defaults to entry point
+        #[arg(short, long, value_parser = parse_hex)]
+        address: Option<u64>,
+        /// Number of parameter registers to treat as tainted
+        #[arg(short, long, default_value = "6")]
+        params: usize,
     },
     /// Export analysis results to JSON
     Export {
@@ -129,6 +153,25 @@ enum Commands {
         #[arg(short = 'b', long = "break", value_parser = parse_hex)]
         breakpoints: Vec<u64>,
     },
+    /// Start a GDB remote (RSP) server for the emulator
+    Gdbserver {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Start address (hex). Defaults to entry point
+        #[arg(short, long, value_parser = parse_hex)]
+        start: Option<u64>,
+        /// Listen address (host:port)
+        #[arg(short, long, default_value = "127.0.0.1:1234")]
+        listen: String,
+    },
+    /// Interactive debugger (step, breakpoints, registers, memory)
+    Debug {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Start address (hex). Defaults to entry point
+        #[arg(short, long, value_parser = parse_hex)]
+        start: Option<u64>,
+    },
     /// Hex dump at a given address
     Hexdump {
         /// Path to the binary file
@@ -139,6 +182,75 @@ enum Commands {
         /// Number of bytes to dump
         #[arg(default_value = "256")]
         length: usize,
+    },
+    /// Find strings in the binary
+    Strings {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Minimum string length
+        #[arg(short, long, default_value = "4")]
+        min_length: usize,
+        /// Search all sections, not just data sections
+        #[arg(long)]
+        all: bool,
+    },
+    /// Diff two binaries (compare analysis results)
+    Diff {
+        /// Path to the first binary
+        file_a: PathBuf,
+        /// Path to the second binary
+        file_b: PathBuf,
+    },
+    /// List imports and exports
+    Imports {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Show exports instead of imports
+        #[arg(long)]
+        exports: bool,
+    },
+    /// Show analysis coverage statistics
+    Coverage {
+        /// Path to the binary file
+        file: PathBuf,
+    },
+    /// Search for byte patterns in the binary
+    Search {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Hex byte pattern (e.g. "48 8b ?? 24" with ?? as wildcards)
+        #[arg(long)]
+        hex: Option<String>,
+        /// Text/regex pattern to search for
+        #[arg(long)]
+        text: Option<String>,
+        /// Maximum number of results
+        #[arg(short = 'n', long, default_value = "50")]
+        max_results: usize,
+    },
+    /// Run a script of analysis commands
+    Script {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Path to the script file (.grs)
+        script: PathBuf,
+    },
+    /// Patch a binary file
+    Patch {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Address to patch (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+        /// Hex bytes to write (e.g. "90 90 90")
+        #[arg(long)]
+        bytes: Option<String>,
+        /// Assembly instruction to assemble and write
+        #[arg(long)]
+        asm: Option<String>,
+        /// Output file path (default: overwrites input)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -165,7 +277,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             file,
             start,
             count,
-        } => cmd_disasm(&file, start, count),
+        } => cmd_disasm(&file, start, count, cli.thumb),
         Commands::Registers { file } => cmd_registers(&file),
         Commands::Analyze { file } => cmd_analyze(&file),
         Commands::Functions { file } => cmd_functions(&file),
@@ -175,16 +287,26 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             file,
             start,
             count,
-        } => cmd_pcode(&file, start, count),
-        Commands::Decompile { file, address, ssa } => cmd_decompile(&file, address, ssa),
+        } => cmd_pcode(&file, start, count, cli.thumb),
+        Commands::Decompile { file, address, ssa, rust } => cmd_decompile(&file, address, ssa, rust, cli.thumb),
+        Commands::Taint { file, address, params } => cmd_taint(&file, address, params, cli.thumb),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
         Commands::ExportXml { file, output } => cmd_export_xml(&file, output.as_deref()),
-        Commands::Emulate { file, start, steps, breakpoints } => cmd_emulate(&file, start, steps, &breakpoints),
+        Commands::Emulate { file, start, steps, breakpoints } => cmd_emulate(&file, start, steps, &breakpoints, cli.thumb),
+        Commands::Gdbserver { file, start, listen } => cmd_gdbserver(&file, start, &listen, cli.thumb),
+        Commands::Debug { file, start } => cmd_debug(&file, start, cli.thumb),
         Commands::Hexdump {
             file,
             address,
             length,
         } => cmd_hexdump(&file, address, length),
+        Commands::Strings { file, min_length, all } => cmd_strings(&file, min_length, all),
+        Commands::Diff { file_a, file_b } => cmd_diff(&file_a, &file_b),
+        Commands::Imports { file, exports } => cmd_imports(&file, exports),
+        Commands::Coverage { file } => cmd_coverage(&file),
+        Commands::Script { file, script } => cmd_script(&file, &script, cli.thumb),
+        Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
+        Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
     }
 }
 
@@ -334,9 +456,9 @@ fn cmd_hexdump(
     Ok(())
 }
 
-fn cmd_disasm(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_disasm(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
-    let arch = create_architecture(info.arch)?;
+    let arch = create_architecture_with_options(info.arch, thumb)?;
     let address = start.unwrap_or(info.entry_point);
 
     println!(
@@ -393,6 +515,61 @@ fn cmd_registers(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn create_lifter(
+    arch: gr_loader::Architecture,
+    bits: u32,
+    endian: gr_core::address::Endian,
+    thumb: bool,
+) -> Option<Box<dyn PcodeLift>> {
+    match arch {
+        gr_loader::Architecture::X86 | gr_loader::Architecture::X86_64 => {
+            if bits == 64 { Some(Box::new(X86Lifter::new_64())) } else { Some(Box::new(X86Lifter::new_32())) }
+        }
+        gr_loader::Architecture::Arm64 => Some(Box::new(Aarch64Lifter::new())),
+        gr_loader::Architecture::Arm => Some(Box::new(if thumb {
+            Arm32Lifter::new_thumb(endian)
+        } else {
+            Arm32Lifter::new(endian)
+        })),
+        gr_loader::Architecture::Mips => Some(Box::new(MipsLifter::new_32(endian))),
+        gr_loader::Architecture::Riscv32 => Some(Box::new(RiscVLifter::new_rv32())),
+        gr_loader::Architecture::PowerPc => Some(Box::new(PpcLifter::new_32(endian))),
+        gr_loader::Architecture::Sparc => Some(Box::new(SparcLifter::new_32())),
+        _ => None,
+    }
+}
+
+/// Build the per-address ARM/Thumb region map from ELF `$a`/`$t`/`$d` mapping
+/// symbols (names may carry a `.N` suffix).
+fn arm_region_mapping(info: &gr_loader::BinaryInfo) -> Vec<(u64, ArmRegion)> {
+    let mut mapping = Vec::new();
+    for sym in &info.symbols {
+        let region = if sym.name == "$a" || sym.name.starts_with("$a.") {
+            ArmRegion::Arm
+        } else if sym.name == "$t" || sym.name.starts_with("$t.") {
+            ArmRegion::Thumb
+        } else if sym.name == "$d" || sym.name.starts_with("$d.") {
+            ArmRegion::Data
+        } else {
+            continue;
+        };
+        mapping.push((sym.address, region));
+    }
+    mapping
+}
+
+/// Select a lifter for a loaded binary. For ARM, mapping symbols drive
+/// automatic A32/Thumb switching unless `force_thumb` overrides to all-Thumb.
+fn make_lifter(info: &gr_loader::BinaryInfo, force_thumb: bool) -> Option<Box<dyn PcodeLift>> {
+    if info.arch == gr_loader::Architecture::Arm && !force_thumb {
+        let mapping = arm_region_mapping(info);
+        if !mapping.is_empty() {
+            return Some(Box::new(MappedArmLifter::new(info.endian, mapping)));
+        }
+    }
+    create_lifter(info.arch, info.bits, info.endian, force_thumb)
 }
 
 fn analyze_binary(path: &Path) -> Result<Program, Box<dyn std::error::Error>> {
@@ -513,26 +690,19 @@ fn cmd_callgraph(path: &Path, dot: bool) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn cmd_pcode(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_pcode(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
 
-    let is_64 = info.bits == 64;
-    let lifter: Box<dyn PcodeLift> = match info.arch {
-        gr_loader::Architecture::X86 | gr_loader::Architecture::X86_64 => {
-            if is_64 {
-                Box::new(X86Lifter::new_64())
-            } else {
-                Box::new(X86Lifter::new_32())
-            }
-        }
-        other => {
-            eprintln!("P-code lifting not yet supported for {}", other);
+    let lifter = match make_lifter(&info, thumb) {
+        Some(l) => l,
+        None => {
+            eprintln!("P-code lifting not yet supported for {}", info.arch);
             return Ok(());
         }
     };
 
     let address = start.unwrap_or(info.entry_point);
-    println!("P-code listing at 0x{:x} ({}):\n", address, if is_64 { "x86_64" } else { "x86" });
+    println!("P-code listing at 0x{:x} ({}):\n", address, info.arch);
 
     let lifted = lifter.lift_range(&info.memory, address, count)?;
     for insn in &lifted {
@@ -544,20 +714,13 @@ fn cmd_pcode(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dy
     Ok(())
 }
 
-fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
-    let is_64 = program.info.bits == 64;
-    let lifter: Box<dyn PcodeLift> = match program.info.arch {
-        gr_loader::Architecture::X86 | gr_loader::Architecture::X86_64 => {
-            if is_64 {
-                Box::new(X86Lifter::new_64())
-            } else {
-                Box::new(X86Lifter::new_32())
-            }
-        }
-        other => {
-            eprintln!("Decompilation not yet supported for {}", other);
+    let lifter = match make_lifter(&program.info, thumb) {
+        Some(l) => l,
+        None => {
+            eprintln!("Decompilation not yet supported for {}", program.info.arch);
             return Ok(());
         }
     };
@@ -570,7 +733,16 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool) -> Result<()
     if show_ssa {
         print!("{}", result.ssa_dump);
     } else {
-        print!("{}", result.c_code);
+        if !result.recovered_structs.is_empty() {
+            for def in &result.recovered_structs {
+                println!("{}\n", def);
+            }
+        }
+        if show_rust {
+            print!("{}", result.rust_code);
+        } else {
+            print!("{}", result.c_code);
+        }
     }
 
     eprintln!(
@@ -581,6 +753,46 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool) -> Result<()
         result.stats.live_ops_after,
         result.stats.optimization,
     );
+    Ok(())
+}
+
+fn cmd_taint(path: &Path, address: Option<u64>, params: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    let lifter = match make_lifter(&program.info, thumb) {
+        Some(l) => l,
+        None => {
+            eprintln!("Taint analysis not yet supported for {}", program.info.arch);
+            return Ok(());
+        }
+    };
+
+    // System V AMD64 parameter-passing order (REGISTER-space offsets).
+    const SYSV_PARAM_REGS: [(u64, &str); 6] = [
+        (0x38, "rdi"), (0x30, "rsi"), (0x10, "rdx"),
+        (0x08, "rcx"), (0x80, "r8"), (0x88, "r9"),
+    ];
+    let n = params.min(SYSV_PARAM_REGS.len());
+    let offsets: Vec<u64> = SYSV_PARAM_REGS[..n].iter().map(|(o, _)| *o).collect();
+
+    let entry = address.unwrap_or(program.entry_point());
+    let report = gr_decompile::analyze_taint(lifter.as_ref(), &program, entry, &offsets)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    let names: Vec<&str> = SYSV_PARAM_REGS[..n].iter().map(|(_, name)| *name).collect();
+    println!("Taint analysis at 0x{:x}", entry);
+    println!("  Tainted sources: {} ({})", n, names.join(", "));
+    println!("  Tainted values:  {}", report.tainted_values);
+    println!("{}", "-".repeat(60));
+
+    if report.sinks.is_empty() {
+        println!("  No tainted data reaches a dangerous sink.");
+    } else {
+        println!("  {} tainted sink(s) found:", report.sinks.len());
+        for sink in &report.sinks {
+            println!("    0x{:x}  {}", sink.address, sink.kind.describe());
+        }
+    }
     Ok(())
 }
 
@@ -624,16 +836,14 @@ fn cmd_export_xml(path: &Path, output: Option<&Path>) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u64]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u64], thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
 
     let is_64 = info.bits == 64;
-    let lifter: Box<dyn PcodeLift> = match info.arch {
-        gr_loader::Architecture::X86 | gr_loader::Architecture::X86_64 => {
-            if is_64 { Box::new(X86Lifter::new_64()) } else { Box::new(X86Lifter::new_32()) }
-        }
-        other => {
-            eprintln!("Emulation not yet supported for {}", other);
+    let lifter = match make_lifter(&info, thumb) {
+        Some(l) => l,
+        None => {
+            eprintln!("Emulation not yet supported for {}", info.arch);
             return Ok(());
         }
     };
@@ -659,13 +869,14 @@ fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u
 
     let mut addr = entry;
     let mut total_steps = 0u64;
+    let mut lift_ctx = LiftContext::default();
 
     while total_steps < max_steps {
         if bp_mgr.check(addr) {
             println!("  ** Breakpoint hit at 0x{:x} **", addr);
             break;
         }
-        let lifted = match lifter.lift_instruction(&info.memory, addr) {
+        let lifted = match lifter.lift_instruction_ctx(&info.memory, addr, &mut lift_ctx) {
             Ok(l) => l,
             Err(e) => { println!("  [0x{:x}] decode error: {}", addr, e); break; }
         };
@@ -691,4 +902,717 @@ fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u
         if val != 0 { println!("  {:<6} = 0x{:016x}", name, val); }
     }
     Ok(())
+}
+
+/// A live emulator wired up as a GDB debug target.
+struct EmulatorTarget {
+    emu: gr_emulator::Emulator,
+    lifter: Box<dyn PcodeLift>,
+    memory: Memory,
+    pc: u64,
+    breakpoints: std::collections::BTreeSet<u64>,
+    exited: bool,
+    lift_ctx: LiftContext,
+}
+
+impl EmulatorTarget {
+    const MAX_CONTINUE_STEPS: u64 = 10_000_000;
+
+    /// Execute a single instruction at the current PC, advancing it.
+    fn step_one(&mut self) -> gr_emulator::StopReason {
+        if self.exited {
+            return gr_emulator::StopReason::Exited(0);
+        }
+        let lifted = match self.lifter.lift_instruction_ctx(&self.memory, self.pc, &mut self.lift_ctx) {
+            Ok(l) => l,
+            Err(_) => {
+                self.exited = true;
+                return gr_emulator::StopReason::Signal(4); // SIGILL
+            }
+        };
+        let next = self.pc + lifted.length as u64;
+        for op in &lifted.ops {
+            match self.emu.execute_op(op) {
+                Ok(()) => {}
+                Err(gr_emulator::emulator::EmulatorError::Branch(t)) => { self.pc = t; return gr_emulator::StopReason::Trap; }
+                Err(gr_emulator::emulator::EmulatorError::Call(t)) => { self.pc = t; return gr_emulator::StopReason::Trap; }
+                Err(gr_emulator::emulator::EmulatorError::Return(_)) => { self.exited = true; return gr_emulator::StopReason::Exited(0); }
+                Err(_) => { self.exited = true; return gr_emulator::StopReason::Signal(11); } // SIGSEGV
+            }
+        }
+        self.pc = next;
+        gr_emulator::StopReason::Trap
+    }
+
+    fn current_pc(&self) -> u64 {
+        self.pc
+    }
+
+    fn has_exited(&self) -> bool {
+        self.exited
+    }
+
+    /// Disassemble `count` instructions starting at `addr` (or current PC).
+    fn disassemble(&self, addr: Option<u64>, count: usize) -> Vec<(u64, String)> {
+        let mut at = addr.unwrap_or(self.pc);
+        let mut out = Vec::new();
+        for _ in 0..count {
+            match self.lifter.lift_instruction(&self.memory, at) {
+                Ok(insn) => {
+                    out.push((at, insn.mnemonic.clone()));
+                    if insn.length == 0 {
+                        break;
+                    }
+                    at += insn.length as u64;
+                }
+                Err(_) => break,
+            }
+        }
+        out
+    }
+}
+
+/// Build an emulator debug target from a loaded binary, taking ownership of its memory.
+fn build_emulator_target(
+    info: gr_loader::BinaryInfo,
+    entry: u64,
+    thumb: bool,
+) -> Option<EmulatorTarget> {
+    let lifter = make_lifter(&info, thumb)?;
+    let is_64 = info.bits == 64;
+    let mut emu = gr_emulator::Emulator::new();
+    for block in info.memory.blocks() {
+        if let Some(data) = &block.data {
+            emu.state.load_memory_bytes(block.start, data);
+        }
+    }
+    emu.state.write_register(0x20, if is_64 { 8 } else { 4 }, if is_64 { 0x7FFF_FFFF_FFF0 } else { 0xFFFF_FFF0 });
+    Some(EmulatorTarget {
+        emu,
+        lifter,
+        memory: info.memory,
+        pc: entry,
+        breakpoints: std::collections::BTreeSet::new(),
+        exited: false,
+        lift_ctx: LiftContext::default(),
+    })
+}
+
+impl gr_emulator::DebugTarget for EmulatorTarget {
+    fn read_registers(&self) -> Vec<u8> {
+        let mut state = self.emu.state.clone();
+        state.write_register(gr_emulator::gdbserver::AMD64_PC_OFFSET, 8, self.pc);
+        gr_emulator::gdbserver::amd64_read_registers(&state)
+    }
+
+    fn write_registers(&mut self, data: &[u8]) {
+        gr_emulator::gdbserver::amd64_write_registers(&mut self.emu.state, data);
+        self.pc = self.emu.state.read_register(gr_emulator::gdbserver::AMD64_PC_OFFSET, 8);
+    }
+
+    fn read_memory(&self, addr: u64, len: usize) -> Vec<u8> {
+        (0..len as u64)
+            .map(|i| self.memory.read_byte(addr + i).unwrap_or(0))
+            .collect()
+    }
+
+    fn write_memory(&mut self, addr: u64, data: &[u8]) {
+        self.emu.state.load_memory_bytes(addr, data);
+    }
+
+    fn resume(&mut self, step: bool) -> gr_emulator::StopReason {
+        if step {
+            return self.step_one();
+        }
+        for _ in 0..Self::MAX_CONTINUE_STEPS {
+            let reason = self.step_one();
+            if !matches!(reason, gr_emulator::StopReason::Trap) {
+                return reason;
+            }
+            if self.breakpoints.contains(&self.pc) {
+                return gr_emulator::StopReason::Trap;
+            }
+        }
+        gr_emulator::StopReason::Trap
+    }
+
+    fn add_breakpoint(&mut self, addr: u64) {
+        self.breakpoints.insert(addr);
+    }
+
+    fn remove_breakpoint(&mut self, addr: u64) {
+        self.breakpoints.remove(&addr);
+    }
+}
+
+fn cmd_gdbserver(path: &Path, start: Option<u64>, listen: &str, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+    let arch = info.arch;
+    let entry = start.unwrap_or(info.entry_point);
+
+    let target = match build_emulator_target(info, entry, thumb) {
+        Some(t) => t,
+        None => {
+            eprintln!("Emulation not yet supported for {}", arch);
+            return Ok(());
+        }
+    };
+
+    println!("GDB server listening on {} (entry 0x{:x})", listen, entry);
+    println!("Connect with: gdb -ex 'target remote {}'", listen);
+    gr_emulator::gdbserver::serve(listen, target)?;
+    println!("GDB client disconnected.");
+    Ok(())
+}
+
+fn cmd_debug(path: &Path, start: Option<u64>, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    use gr_emulator::DebugTarget as _;
+    use gr_emulator::tui;
+
+    let info = BinaryLoader::load(path)?;
+    let arch = info.arch;
+    let entry = start.unwrap_or(info.entry_point);
+
+    let mut target = match build_emulator_target(info, entry, thumb) {
+        Some(t) => t,
+        None => {
+            eprintln!("Emulation not yet supported for {}", arch);
+            return Ok(());
+        }
+    };
+
+    println!("Interactive debugger ({}). Type 'help' for commands.", arch);
+    print_current_location(&target);
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("(dbg 0x{:x})> ", target.current_pc());
+        std::io::stdout().flush().ok();
+
+        line.clear();
+        if stdin.read_line(&mut line)? == 0 {
+            break; // EOF
+        }
+
+        match gr_emulator::parse_debug_command(&line) {
+            gr_emulator::DebugCommand::Quit => break,
+            gr_emulator::DebugCommand::Empty => {}
+            gr_emulator::DebugCommand::Help => println!("{}", tui::debug_help()),
+            gr_emulator::DebugCommand::Step => {
+                let reason = target.resume(true);
+                report_stop(&target, reason);
+            }
+            gr_emulator::DebugCommand::Continue => {
+                let reason = target.resume(false);
+                report_stop(&target, reason);
+            }
+            gr_emulator::DebugCommand::Registers => {
+                print_registers(&target);
+            }
+            gr_emulator::DebugCommand::Breakpoint(addr) => {
+                target.add_breakpoint(addr);
+                println!("Breakpoint set at 0x{:x}", addr);
+            }
+            gr_emulator::DebugCommand::DeleteBreakpoint(addr) => {
+                target.remove_breakpoint(addr);
+                println!("Breakpoint removed at 0x{:x}", addr);
+            }
+            gr_emulator::DebugCommand::Examine { addr, len } => {
+                let at = addr.unwrap_or(target.current_pc());
+                let bytes = target.read_memory(at, len);
+                print!("{}", tui::format_memory_dump(&bytes, at, 16));
+            }
+            gr_emulator::DebugCommand::Disassemble { addr, count } => {
+                for (a, text) in target.disassemble(addr, count) {
+                    let marker = if a == target.current_pc() { "=>" } else { "  " };
+                    println!("{} 0x{:08x}  {}", marker, a, text);
+                }
+            }
+            gr_emulator::DebugCommand::Info => print_current_location(&target),
+            gr_emulator::DebugCommand::Unknown(s) => {
+                println!("Unknown command: '{}' (type 'help')", s);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_current_location(target: &EmulatorTarget) {
+    if target.has_exited() {
+        println!("Program has exited.");
+        return;
+    }
+    let disasm = target.disassemble(None, 1);
+    if let Some((addr, text)) = disasm.first() {
+        println!("=> 0x{:08x}  {}", addr, text);
+    }
+}
+
+fn report_stop(target: &EmulatorTarget, reason: gr_emulator::StopReason) {
+    match reason {
+        gr_emulator::StopReason::Trap => print_current_location(target),
+        gr_emulator::StopReason::Exited(code) => println!("Program exited (code {})", code),
+        gr_emulator::StopReason::Signal(s) => println!("Stopped on signal {}", s),
+    }
+}
+
+fn print_registers(target: &EmulatorTarget) {
+    use gr_emulator::DebugTarget as _;
+    let block = target.read_registers();
+    let names = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                 "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip"];
+    for (i, name) in names.iter().enumerate() {
+        let start = i * 8;
+        if start + 8 <= block.len() {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&block[start..start + 8]);
+            let val = u64::from_le_bytes(buf);
+            print!("{:<4}= 0x{:016x}  ", name, val);
+            if (i + 1) % 3 == 0 {
+                println!();
+            }
+        }
+    }
+    println!();
+}
+
+fn cmd_strings(path: &Path, min_length: usize, all_sections: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+
+    println!("{:<18} {:>6} String", "Address", "Length");
+    println!("{}", "-".repeat(70));
+
+    let mut total = 0;
+    for section in &info.sections {
+        if !all_sections && !is_data_section(&section.name) {
+            continue;
+        }
+        let mut buf = vec![0u8; section.size as usize];
+        if info.memory.read_bytes(section.address, &mut buf).is_err() {
+            continue;
+        }
+        let found = find_strings(&buf, section.address);
+        for (addr, s) in &found {
+            if s.len() >= min_length {
+                let display = if s.len() > 80 { format!("{}...", &s[..77]) } else { s.clone() };
+                println!("0x{:016x} {:>6} {}", addr, s.len(), display);
+                total += 1;
+            }
+        }
+    }
+
+    println!("\nTotal: {} strings", total);
+    Ok(())
+}
+
+fn cmd_diff(path_a: &Path, path_b: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("Analyzing {}...", path_a.display());
+    let prog_a = analyze_binary(path_a)?;
+    let summary_a = ProjectSummary::from_program(&prog_a);
+
+    eprintln!("Analyzing {}...", path_b.display());
+    let prog_b = analyze_binary(path_b)?;
+    let summary_b = ProjectSummary::from_program(&prog_b);
+
+    let diff = ProgramDiff::compare(&summary_a, &summary_b);
+
+    println!("\nDiff: {} vs {}", path_a.display(), path_b.display());
+    println!("{}", "-".repeat(60));
+    println!("{}", diff.summary());
+
+    if !diff.added_functions.is_empty() {
+        println!("\nAdded functions ({}):", diff.added_functions.len());
+        for addr in &diff.added_functions {
+            let name = summary_b.functions.iter()
+                .find(|f| f.address == *addr)
+                .map(|f| f.name.as_str())
+                .unwrap_or("???");
+            println!("  + 0x{:x} {}", addr, name);
+        }
+    }
+
+    if !diff.removed_functions.is_empty() {
+        println!("\nRemoved functions ({}):", diff.removed_functions.len());
+        for addr in &diff.removed_functions {
+            let name = summary_a.functions.iter()
+                .find(|f| f.address == *addr)
+                .map(|f| f.name.as_str())
+                .unwrap_or("???");
+            println!("  - 0x{:x} {}", addr, name);
+        }
+    }
+
+    if !diff.modified_functions.is_empty() {
+        println!("\nModified functions ({}):", diff.modified_functions.len());
+        for (addr, desc) in &diff.modified_functions {
+            println!("  ~ 0x{:x} {}", addr, desc);
+        }
+    }
+
+    if !diff.has_changes() {
+        println!("\n  No differences found.");
+    }
+    Ok(())
+}
+
+fn cmd_imports(path: &Path, show_exports: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+
+    if show_exports {
+        let exports: Vec<_> = info.symbols.iter()
+            .filter(|s| s.kind == SymbolKind::Export)
+            .collect();
+        println!("{:<18} {:>8} Name", "Address", "Size");
+        println!("{}", "-".repeat(60));
+        for sym in &exports {
+            println!("0x{:016x} {:>8} {}", sym.address, sym.size, sym.name);
+        }
+        println!("\nTotal: {} exports", exports.len());
+    } else {
+        println!("{:<18} Name", "Address");
+        println!("{}", "-".repeat(60));
+
+        if !info.imports.is_empty() {
+            for imp in &info.imports {
+                println!("0x{:016x} {}", imp.plt_address, imp.name);
+            }
+            println!("\nTotal: {} imports", info.imports.len());
+        } else {
+            let imports: Vec<_> = info.symbols.iter()
+                .filter(|s| s.kind == SymbolKind::Import)
+                .collect();
+            for sym in &imports {
+                println!("0x{:016x} {}", sym.address, sym.name);
+            }
+            println!("\nTotal: {} imports", imports.len());
+        }
+
+        if !info.dynamic.needed_libs.is_empty() {
+            println!("\nRequired libraries:");
+            for lib in &info.dynamic.needed_libs {
+                println!("  {}", lib);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_coverage(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    let total_code: u64 = program.info.sections.iter()
+        .filter(|s| s.flags.contains(SectionFlags::EXECUTE))
+        .map(|s| s.size)
+        .sum();
+    let analyzed = program.listing.instruction_count() as u64;
+    let coverage = if total_code > 0 { analyzed as f64 / total_code as f64 * 100.0 } else { 0.0 };
+
+    println!("Analysis coverage for {}:", path.display());
+    println!("{}", "-".repeat(50));
+    println!("  Executable bytes: {}", total_code);
+    println!("  Analyzed bytes:   {}", analyzed);
+    println!("  Coverage:         {:.1}%", coverage);
+    println!("  Functions:        {}", program.listing.function_count());
+    println!("  Instructions:     {}", program.listing.instruction_count());
+
+    println!("\nPer-section breakdown:");
+    println!("  {:<25} {:>10} {:>10} {:>8}", "Section", "Size", "Flags", "Type");
+    println!("  {}", "-".repeat(58));
+    for section in &program.info.sections {
+        let flags = format!(
+            "{}{}{}",
+            if section.flags.contains(SectionFlags::READ) { "r" } else { "-" },
+            if section.flags.contains(SectionFlags::WRITE) { "w" } else { "-" },
+            if section.flags.contains(SectionFlags::EXECUTE) { "x" } else { "-" },
+        );
+        let stype = if section.flags.contains(SectionFlags::EXECUTE) { "code" } else { "data" };
+        println!("  {:<25} {:>10} {:>10} {:>8}", section.name, section.size, flags, stype);
+    }
+    Ok(())
+}
+
+fn parse_hex_pattern(pattern: &str) -> Vec<Option<u8>> {
+    pattern
+        .split_whitespace()
+        .map(|token| {
+            if token == "??" || token == "?" {
+                None
+            } else {
+                u8::from_str_radix(token, 16).ok()
+            }
+        })
+        .collect()
+}
+
+fn search_pattern(data: &[u8], pattern: &[Option<u8>]) -> Vec<usize> {
+    if pattern.is_empty() || data.len() < pattern.len() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    for i in 0..=(data.len() - pattern.len()) {
+        let mut matched = true;
+        for (j, p) in pattern.iter().enumerate() {
+            if let Some(byte) = p
+                && data[i + j] != *byte {
+                    matched = false;
+                    break;
+                }
+        }
+        if matched {
+            matches.push(i);
+        }
+    }
+    matches
+}
+
+fn cmd_search(
+    path: &Path,
+    hex_pattern: Option<&str>,
+    text_pattern: Option<&str>,
+    max_results: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+
+    if hex_pattern.is_none() && text_pattern.is_none() {
+        eprintln!("Specify --hex or --text pattern");
+        return Ok(());
+    }
+
+    println!("{:<18} {:>8} {:>20} Match", "Address", "Offset", "Section");
+    println!("{}", "-".repeat(70));
+
+    let mut total = 0;
+
+    for section in &info.sections {
+        let mut buf = vec![0u8; section.size as usize];
+        if info.memory.read_bytes(section.address, &mut buf).is_err() {
+            continue;
+        }
+
+        if let Some(hex) = hex_pattern {
+            let pattern = parse_hex_pattern(hex);
+            let matches = search_pattern(&buf, &pattern);
+            for offset in matches {
+                if total >= max_results { break; }
+                let addr = section.address + offset as u64;
+                let context: Vec<String> = buf[offset..std::cmp::min(offset + pattern.len() + 4, buf.len())]
+                    .iter()
+                    .take(16)
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+                println!(
+                    "0x{:016x} {:>8} {:>20} {}",
+                    addr,
+                    format!("+0x{:x}", offset),
+                    section.name,
+                    context.join(" ")
+                );
+                total += 1;
+            }
+        }
+
+        if let Some(text) = text_pattern {
+            let text_bytes = text.as_bytes();
+            let pattern: Vec<Option<u8>> = text_bytes.iter().map(|b| Some(*b)).collect();
+            let matches = search_pattern(&buf, &pattern);
+            for offset in matches {
+                if total >= max_results { break; }
+                let addr = section.address + offset as u64;
+                let end = std::cmp::min(offset + text_bytes.len() + 16, buf.len());
+                let display: String = buf[offset..end]
+                    .iter()
+                    .take(60)
+                    .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                    .collect();
+                println!(
+                    "0x{:016x} {:>8} {:>20} \"{}\"",
+                    addr,
+                    format!("+0x{:x}", offset),
+                    section.name,
+                    display
+                );
+                total += 1;
+            }
+        }
+    }
+
+    println!("\nTotal: {} matches", total);
+    Ok(())
+}
+
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    s.split_whitespace()
+        .map(|token| u8::from_str_radix(token, 16).map_err(|e| format!("invalid hex byte '{}': {}", token, e)))
+        .collect()
+}
+
+fn cmd_patch(
+    path: &Path,
+    address: u64,
+    hex_bytes: Option<&str>,
+    _asm_str: Option<&str>,
+    output: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut data = std::fs::read(path)?;
+    let info = BinaryLoader::load(path)?;
+
+    let patch_bytes = if let Some(hex) = hex_bytes {
+        parse_hex_bytes(hex)?
+    } else {
+        eprintln!("Specify --bytes with hex byte values");
+        return Ok(());
+    };
+
+    let file_offset = find_file_offset(&info, address, &data)?;
+
+    if file_offset + patch_bytes.len() > data.len() {
+        return Err("patch extends beyond file boundary".into());
+    }
+
+    println!("Patching {} at 0x{:x} (file offset 0x{:x}):", path.display(), address, file_offset);
+    print!("  Before: ");
+    for i in 0..patch_bytes.len() {
+        print!("{:02x} ", data[file_offset + i]);
+    }
+    println!();
+
+    data[file_offset..file_offset + patch_bytes.len()].copy_from_slice(&patch_bytes);
+
+    print!("  After:  ");
+    for b in &patch_bytes {
+        print!("{:02x} ", b);
+    }
+    println!();
+
+    let out_path = output.unwrap_or(path);
+    std::fs::write(out_path, &data)?;
+    println!("Written to: {}", out_path.display());
+    Ok(())
+}
+
+fn cmd_script(path: &Path, script_path: &Path, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let script = std::fs::read_to_string(script_path)
+        .map_err(|e| format!("cannot read script: {}", e))?;
+
+    let info = BinaryLoader::load(path)?;
+    let mut program = Program::from_binary(path)?;
+    let manager = AnalysisManager::new();
+
+    for (line_num, line) in script.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.splitn(2, ' ').collect();
+        let cmd = parts[0];
+        let args = parts.get(1).unwrap_or(&"").trim();
+
+        match cmd {
+            "analyze" => {
+                let results = manager.run_all(&mut program);
+                for r in &results {
+                    match r {
+                        Ok(r) => println!("[{}] {} functions, {} refs", r.analyzer_name, r.functions_found, r.references_found),
+                        Err(e) => eprintln!("[ERROR] {}", e),
+                    }
+                }
+            }
+            "info" => {
+                println!("Format: {}, Arch: {}, Entry: 0x{:x}", info.format, info.arch, info.entry_point);
+            }
+            "functions" => {
+                for func in program.listing.functions() {
+                    println!("0x{:x} {}", func.entry_point, func.name);
+                }
+            }
+            "symbols" => {
+                for sym in program.symbol_table.iter() {
+                    println!("0x{:x} {:?} {}", sym.address, sym.symbol_type, sym.name);
+                }
+            }
+            "xrefs" => {
+                if let Ok(addr) = parse_hex(args) {
+                    let refs = program.references.get_refs_to(addr);
+                    for r in refs {
+                        println!("  0x{:x} -> 0x{:x} [{}]", r.from, r.to, r.ref_type);
+                    }
+                }
+            }
+            "strings" => {
+                for section in &info.sections {
+                    if !is_data_section(&section.name) { continue; }
+                    let mut buf = vec![0u8; section.size as usize];
+                    if info.memory.read_bytes(section.address, &mut buf).is_err() { continue; }
+                    for (addr, s) in find_strings(&buf, section.address) {
+                        println!("0x{:x} \"{}\"", addr, s);
+                    }
+                }
+            }
+            "decompile" => {
+                if let Some(lifter) = make_lifter(&info, thumb) {
+                    let addr = parse_hex(args).unwrap_or(info.entry_point);
+                    match gr_decompile::decompile_function(lifter.as_ref(), &program, addr) {
+                        Ok(result) => print!("{}", result.c_code),
+                        Err(e) => eprintln!("decompile error: {}", e),
+                    }
+                }
+            }
+            "export" => {
+                let out = if args.is_empty() { "script_output.json" } else { args };
+                let summary = gr_program::ProjectSummary::from_program(&program);
+                summary.save_to_file(Path::new(out))
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                println!("Exported to {}", out);
+            }
+            "print" => {
+                println!("{}", args);
+            }
+            "hexdump" => {
+                let hex_parts: Vec<&str> = args.splitn(2, ' ').collect();
+                if let Some(addr) = hex_parts.first().and_then(|s| parse_hex(s).ok()) {
+                    let len: usize = hex_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(64);
+                    let mut buf = vec![0u8; len];
+                    if info.memory.read_bytes(addr, &mut buf).is_ok() {
+                        for (i, chunk) in buf.chunks(16).enumerate() {
+                            let row_addr = addr + (i * 16) as u64;
+                            print!("  {:08x}  ", row_addr);
+                            for b in chunk { print!("{:02x} ", b); }
+                            println!();
+                        }
+                    }
+                }
+            }
+            _ => {
+                eprintln!("script:{}: unknown command '{}'", line_num + 1, cmd);
+            }
+        }
+    }
+
+    println!("\nScript completed: {} commands processed", script.lines().filter(|l| {
+        let l = l.trim();
+        !l.is_empty() && !l.starts_with('#')
+    }).count());
+    Ok(())
+}
+
+fn find_file_offset(info: &gr_loader::BinaryInfo, address: u64, data: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
+    for section in &info.sections {
+        if address >= section.address && address < section.address + section.size {
+            let section_offset = address - section.address;
+            for block in info.memory.blocks() {
+                if block.start == section.address
+                    && let Some(block_data) = &block.data
+                    && let Some(pos) = data.windows(block_data.len().min(64))
+                        .position(|w| w == &block_data[..w.len()])
+                {
+                    return Ok(pos + section_offset as usize);
+                }
+            }
+            return Err(format!("cannot map address 0x{:x} to file offset", address).into());
+        }
+    }
+    Err(format!("address 0x{:x} not in any section", address).into())
 }
