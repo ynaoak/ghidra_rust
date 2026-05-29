@@ -69,12 +69,25 @@ pub trait PcodeLift: Send + Sync {
 }
 
 /// Cross-instruction decode state threaded through a contiguous lift. Reset at
-/// the start of each independent instruction stream. Currently carries the ARM
-/// Thumb IT-block state; the per-instruction lifter validates it against the
-/// expected address so random-access lifting never misapplies stale state.
+/// the start of each independent instruction stream. Carries the ARM Thumb
+/// IT-block state and a pending SPARC delay-slot control transfer; the
+/// per-instruction lifter validates each against the expected address so
+/// random-access lifting never misapplies stale state.
 #[derive(Debug, Default, Clone)]
 pub struct LiftContext {
     pub it: Option<ItBlock>,
+    pub delay: Option<DelaySlot>,
+}
+
+/// A control-transfer P-code op deferred to the following (delay-slot)
+/// instruction, used to model SPARC's branch delay slots: the transfer is
+/// appended after the delay-slot instruction's own effects.
+#[derive(Debug, Clone)]
+pub struct DelaySlot {
+    /// The control-transfer op to emit after the delay-slot instruction.
+    pub op: PcodeOp,
+    /// Address of the delay-slot instruction this transfer follows.
+    pub addr: u64,
 }
 
 /// ARM Thumb IT (If-Then) block state.

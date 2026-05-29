@@ -2072,7 +2072,7 @@ mod tests {
             data: Some(Arc::from(bytes.as_slice())),
         });
         let lifter = Arm32Lifter::new_thumb(Endian::Little);
-        let mut ctx = LiftContext { it: Some(ItBlock { state: 0x08, addr: 0x1002 }) };
+        let mut ctx = LiftContext { it: Some(ItBlock { state: 0x08, addr: 0x1002 }), delay: None };
         let li = lifter.lift_instruction_ctx(&mem, 0x4000, &mut ctx).unwrap();
         assert_eq!(li.ops[0].opcode, OpCode::Copy); // plain movs, not predicated
         assert!(ctx.it.is_none());

@@ -7,16 +7,20 @@
 //! disassembly text. SPARC is big-endian with fixed 4-byte instructions; `%g0`
 //! reads as 0 and discards writes.
 //!
-//! ADDX/SUBX use the icc carry. Simplifications: branch delay slots are not
-//! reordered (each instruction is lifted independently); SAVE/RESTORE model
-//! only the pointer arithmetic, not the register-window rotation.
+//! ADDX/SUBX use the icc carry. Non-annulling branch delay slots are honoured
+//! via a `LiftContext`: a CALL/JMPL/non-annulling-Bicc defers its control
+//! transfer past the following (delay-slot) instruction, whose effects run
+//! first (the stateless `lift_instruction` path still emits the transfer
+//! inline). Remaining simplifications: annulling branches are not deferred, and
+//! SAVE/RESTORE model only the pointer arithmetic, not the register-window
+//! rotation.
 
 use gr_core::address::{Address, SpaceId};
 use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
 use gr_loader::Memory;
 use smallvec::SmallVec;
 
-use crate::lift::{LiftError, LiftedInstruction, PcodeLift};
+use crate::lift::{DelaySlot, LiftContext, LiftError, LiftedInstruction, PcodeLift};
 
 const CONST_SPACE: SpaceId = SpaceId::CONST;
 const RAM_SPACE: SpaceId = SpaceId::RAM;
@@ -379,6 +383,34 @@ impl SparcLifter {
     }
 }
 
+/// Whether an opcode is a control transfer that ends a basic block.
+fn is_control(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::Branch | OpCode::CBranch | OpCode::Call | OpCode::CallInd | OpCode::BranchInd | OpCode::Return
+    )
+}
+
+impl SparcLifter {
+    /// Whether `word` is a non-annulling control-transfer instruction (CALL,
+    /// JMPL, or a non-annulling Bicc) — the forms whose delay slot always
+    /// executes before the transfer.
+    fn is_nonannul_cti(word: u32) -> bool {
+        match word >> 30 {
+            1 => true,                                   // CALL
+            0 => (word >> 22) & 7 == 2 && (word >> 29) & 1 == 0, // Bicc, annul bit clear
+            2 => (word >> 19) & 0x3F == 0x38,            // JMPL
+            _ => false,
+        }
+    }
+
+    fn read_word_be(&self, memory: &Memory, address: u64) -> Option<u32> {
+        let mut buf = [0u8; 4];
+        memory.read_bytes(address, &mut buf).ok()?;
+        Some(u32::from_be_bytes(buf))
+    }
+}
+
 impl PcodeLift for SparcLifter {
     fn lift_instruction(&self, memory: &Memory, address: u64) -> Result<LiftedInstruction, LiftError> {
         let mut buf = [0u8; 4];
@@ -389,6 +421,33 @@ impl PcodeLift for SparcLifter {
         let ops = self.lift_word(word, address);
         let mnemonic = self.disasm_text(&buf, address, word);
         Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
+    }
+
+    fn lift_instruction_ctx(&self, memory: &Memory, address: u64, ctx: &mut LiftContext) -> Result<LiftedInstruction, LiftError> {
+        // A transfer pending for this address means this instruction is the
+        // delay slot: lift it normally, then append the deferred transfer so the
+        // delay slot's effects happen before control leaves. A stale pending
+        // (address mismatch from a diverged stream) is simply dropped.
+        let pending = ctx.delay.take().filter(|d| d.addr == address);
+
+        let mut li = self.lift_instruction(memory, address)?;
+
+        if let Some(d) = pending {
+            let mut op = d.op;
+            op.seq = SeqNum::new(Address::new(RAM_SPACE, address), li.ops.len() as u32);
+            li.ops.push(op);
+            return Ok(li);
+        }
+
+        // A non-annulling CTI defers its trailing control op to the delay slot.
+        if let Some(word) = self.read_word_be(memory, address)
+            && Self::is_nonannul_cti(word)
+            && li.ops.last().map(|o| is_control(o.opcode)).unwrap_or(false)
+        {
+            let ctrl = li.ops.pop().unwrap();
+            ctx.delay = Some(DelaySlot { op: ctrl, addr: address + 4 });
+        }
+        Ok(li)
     }
 }
 
@@ -417,6 +476,26 @@ mod tests {
         let lifter = SparcLifter::new_32();
         let mem = make_memory(word, 0x1000);
         lifter.lift_instruction(&mem, 0x1000).unwrap().ops
+    }
+
+    /// Lift two words at 0x1000/0x1004 sharing a LiftContext (delay-slot path).
+    fn lift_ctx_two(w0: u32, w1: u32) -> (Vec<PcodeOp>, Vec<PcodeOp>) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&w0.to_be_bytes());
+        bytes.extend_from_slice(&w1.to_be_bytes());
+        let mut mem = Memory::new(CoreSpace(1), Endian::Big);
+        mem.add_block(MemoryBlock {
+            name: ".text".into(),
+            start: 0x1000,
+            size: 8,
+            flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
+            data: Some(Arc::from(bytes.as_slice())),
+        });
+        let lifter = SparcLifter::new_32();
+        let mut ctx = LiftContext::default();
+        let a = lifter.lift_instruction_ctx(&mem, 0x1000, &mut ctx).unwrap().ops;
+        let b = lifter.lift_instruction_ctx(&mem, 0x1004, &mut ctx).unwrap().ops;
+        (a, b)
     }
 
     // Format-3 ALU encoder: op=2, op3, rd, rs1, i, rs2/simm13.
@@ -596,5 +675,78 @@ mod tests {
         // jmpl %o0, %o7 : op=2 op3=0x38 rd=15(o7) rs1=8
         let ops = lift(f3(0x38, O7_INDEX, 8, 0));
         assert!(ops.iter().any(|o| o.opcode == OpCode::CallInd));
+    }
+
+    // ---- Delay slots (Stage 1: non-annulling) ----
+
+    #[test]
+    fn delay_slot_call_defers_transfer() {
+        // call +0x40 (delay slot: add %o0,1,%o0)
+        let call = (1 << 30) | 0x10;
+        let add = f3i(0x00, 8, 8, 1);
+        let (a, b) = lift_ctx_two(call, add);
+        // The branch instruction keeps the %o7 link write but NOT the Call.
+        assert!(!a.iter().any(|o| o.opcode == OpCode::Call));
+        assert!(a.iter().any(|o| o.opcode == OpCode::Copy && o.output.map(|v| v.offset == O7_INDEX as u64 * 4).unwrap_or(false)));
+        // The delay slot runs its own add, then the deferred Call last.
+        assert!(b.iter().any(|o| o.opcode == OpCode::IntAdd));
+        assert_eq!(b.last().unwrap().opcode, OpCode::Call);
+        assert_eq!(b.last().unwrap().inputs[0].offset, 0x1040);
+    }
+
+    #[test]
+    fn delay_slot_jmpl_ret_defers_return() {
+        // ret = jmpl %i7+8,%g0 ; delay slot: restore (modelled as add)
+        let ret = f3i(0x38, 0, I7_INDEX, 8);
+        let restore = f3(0x3D, 8, 8, 9); // restore %o0,%o1,%o0 (pointer add)
+        let (a, b) = lift_ctx_two(ret, restore);
+        // Target is computed at the branch; Return is deferred.
+        assert!(!a.iter().any(|o| o.opcode == OpCode::Return));
+        assert!(a.iter().any(|o| o.opcode == OpCode::IntAdd)); // target = i7 + 8
+        assert_eq!(b.last().unwrap().opcode, OpCode::Return);
+    }
+
+    #[test]
+    fn delay_slot_bicc_defers_cbranch() {
+        // be +8 ; delay slot: add
+        let be = (1 << 25) | (2 << 22) | 2;
+        let add = f3i(0x00, 8, 8, 1);
+        let (a, b) = lift_ctx_two(be, add);
+        assert!(!a.iter().any(|o| o.opcode == OpCode::CBranch));
+        // delay slot's add runs, then the conditional branch last.
+        assert!(b.iter().any(|o| o.opcode == OpCode::IntAdd));
+        assert_eq!(b.last().unwrap().opcode, OpCode::CBranch);
+        assert_eq!(b.last().unwrap().inputs[0].offset, 0x1008);
+    }
+
+    #[test]
+    fn delay_slot_stale_pending_dropped() {
+        // A pending transfer for a different address must not be applied.
+        let lifter = SparcLifter::new_32();
+        let mem = make_memory(f3i(0x00, 8, 8, 1), 0x2000); // a plain add
+        let mut ctx = LiftContext {
+            it: None,
+            delay: Some(DelaySlot {
+                op: PcodeOp {
+                    opcode: OpCode::Return,
+                    seq: SeqNum::new(Address::new(RAM_SPACE, 0x1004), 0),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[reg(I7_INDEX)]),
+                },
+                addr: 0x1004,
+            }),
+        };
+        let ops = lifter.lift_instruction_ctx(&mem, 0x2000, &mut ctx).unwrap().ops;
+        // The stale Return is not appended; only the add's own op is present.
+        assert!(!ops.iter().any(|o| o.opcode == OpCode::Return));
+        assert_eq!(ops[0].opcode, OpCode::IntAdd);
+    }
+
+    #[test]
+    fn delay_slot_only_in_ctx_path() {
+        // The stateless lift still emits the transfer inline (no delay slot).
+        let call = (1 << 30) | 0x10;
+        let ops = lift(call);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Call));
     }
 }
