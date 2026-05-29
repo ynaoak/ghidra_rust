@@ -1139,6 +1139,54 @@ impl PcodeLift for Arm32Lifter {
     }
 }
 
+/// The instruction-set state a region of ARM code is decoded in, derived from
+/// ELF `$a`/`$t`/`$d` mapping symbols.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArmRegion {
+    Arm,
+    Thumb,
+    Data,
+}
+
+/// An ARM lifter that switches between A32 and Thumb decoding per address,
+/// driven by a sorted list of mapping-symbol regions. Code with no preceding
+/// mapping symbol defaults to A32. Data regions are decoded as A32 (callers
+/// rarely lift data).
+pub struct MappedArmLifter {
+    arm: Arm32Lifter,
+    thumb: Arm32Lifter,
+    /// (start_address, region), sorted ascending by start_address.
+    mapping: Vec<(u64, ArmRegion)>,
+}
+
+impl MappedArmLifter {
+    pub fn new(endian: Endian, mut mapping: Vec<(u64, ArmRegion)>) -> Self {
+        mapping.sort_by_key(|(addr, _)| *addr);
+        Self {
+            arm: Arm32Lifter::new_arm(endian),
+            thumb: Arm32Lifter::new_thumb(endian),
+            mapping,
+        }
+    }
+
+    pub fn region_at(&self, address: u64) -> ArmRegion {
+        match self.mapping.binary_search_by(|(addr, _)| addr.cmp(&address)) {
+            Ok(i) => self.mapping[i].1,
+            Err(0) => ArmRegion::Arm,
+            Err(i) => self.mapping[i - 1].1,
+        }
+    }
+}
+
+impl PcodeLift for MappedArmLifter {
+    fn lift_instruction(&self, memory: &Memory, address: u64) -> Result<LiftedInstruction, LiftError> {
+        match self.region_at(address) {
+            ArmRegion::Thumb => self.thumb.lift_instruction(memory, address),
+            _ => self.arm.lift_instruction(memory, address),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1494,6 +1542,44 @@ mod tests {
         // L=1 B=0 imm5=1 (=>*4=4) rn=1 rd=0 => 0x6848
         let li = lift_thumb(&[0x6848]);
         assert!(li.ops.iter().any(|o| o.opcode == OpCode::Load));
+    }
+
+    #[test]
+    fn mapped_lifter_switches_modes() {
+        // 0x1000: ARM region, mov r0,#0 (4 bytes) = 0xE3A00000
+        // 0x1004: Thumb region, movs r0,#5 (2 bytes) = 0x2005, then bx lr 0x4770
+        let mut bytes = vec![0x00, 0x00, 0xa0, 0xe3]; // ARM mov
+        bytes.extend_from_slice(&[0x05, 0x20]); // thumb movs
+        bytes.extend_from_slice(&[0x70, 0x47]); // thumb bx lr
+        let mut mem = Memory::new(CoreSpace(1), Endian::Little);
+        mem.add_block(MemoryBlock {
+            name: ".text".into(),
+            start: 0x1000,
+            size: bytes.len() as u64,
+            flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
+            data: Some(Arc::from(bytes.as_slice())),
+        });
+        let lifter = MappedArmLifter::new(
+            Endian::Little,
+            vec![(0x1000, ArmRegion::Arm), (0x1004, ArmRegion::Thumb)],
+        );
+        assert_eq!(lifter.region_at(0x1000), ArmRegion::Arm);
+        assert_eq!(lifter.region_at(0x1004), ArmRegion::Thumb);
+        assert_eq!(lifter.region_at(0x1006), ArmRegion::Thumb);
+        // ARM instruction at 0x1000 is 4 bytes
+        let a = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(a.length, 4);
+        // Thumb instruction at 0x1004 is 2 bytes
+        let t = lifter.lift_instruction(&mem, 0x1004).unwrap();
+        assert_eq!(t.length, 2);
+    }
+
+    #[test]
+    fn mapped_lifter_defaults_to_arm() {
+        let lifter = MappedArmLifter::new(Endian::Little, vec![(0x2000, ArmRegion::Thumb)]);
+        // address before the first mapping symbol defaults to ARM
+        assert_eq!(lifter.region_at(0x1000), ArmRegion::Arm);
+        assert_eq!(lifter.region_at(0x2000), ArmRegion::Thumb);
     }
 
     #[test]

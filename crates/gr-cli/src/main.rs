@@ -5,7 +5,7 @@ use gr_analysis::{AnalysisManager, CallGraph};
 use gr_analysis::strings::{find_strings, is_data_section};
 use gr_arch::arch::{create_architecture, create_architecture_with_options};
 use gr_lift::aarch64::Aarch64Lifter;
-use gr_lift::arm32::Arm32Lifter;
+use gr_lift::arm32::{Arm32Lifter, ArmRegion, MappedArmLifter};
 use gr_lift::mips::MipsLifter;
 use gr_lift::ppc::PpcLifter;
 use gr_lift::riscv::RiscVLifter;
@@ -539,6 +539,37 @@ fn create_lifter(
     }
 }
 
+/// Build the per-address ARM/Thumb region map from ELF `$a`/`$t`/`$d` mapping
+/// symbols (names may carry a `.N` suffix).
+fn arm_region_mapping(info: &gr_loader::BinaryInfo) -> Vec<(u64, ArmRegion)> {
+    let mut mapping = Vec::new();
+    for sym in &info.symbols {
+        let region = if sym.name == "$a" || sym.name.starts_with("$a.") {
+            ArmRegion::Arm
+        } else if sym.name == "$t" || sym.name.starts_with("$t.") {
+            ArmRegion::Thumb
+        } else if sym.name == "$d" || sym.name.starts_with("$d.") {
+            ArmRegion::Data
+        } else {
+            continue;
+        };
+        mapping.push((sym.address, region));
+    }
+    mapping
+}
+
+/// Select a lifter for a loaded binary. For ARM, mapping symbols drive
+/// automatic A32/Thumb switching unless `force_thumb` overrides to all-Thumb.
+fn make_lifter(info: &gr_loader::BinaryInfo, force_thumb: bool) -> Option<Box<dyn PcodeLift>> {
+    if info.arch == gr_loader::Architecture::Arm && !force_thumb {
+        let mapping = arm_region_mapping(info);
+        if !mapping.is_empty() {
+            return Some(Box::new(MappedArmLifter::new(info.endian, mapping)));
+        }
+    }
+    create_lifter(info.arch, info.bits, info.endian, force_thumb)
+}
+
 fn analyze_binary(path: &Path) -> Result<Program, Box<dyn std::error::Error>> {
     let mut program = Program::from_binary(path)?;
     let manager = AnalysisManager::new();
@@ -660,7 +691,7 @@ fn cmd_callgraph(path: &Path, dot: bool) -> Result<(), Box<dyn std::error::Error
 fn cmd_pcode(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
 
-    let lifter = match create_lifter(info.arch, info.bits, info.endian, thumb) {
+    let lifter = match make_lifter(&info, thumb) {
         Some(l) => l,
         None => {
             eprintln!("P-code lifting not yet supported for {}", info.arch);
@@ -684,7 +715,7 @@ fn cmd_pcode(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Resu
 fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
-    let lifter = match create_lifter(program.info.arch, program.info.bits, program.info.endian, thumb) {
+    let lifter = match make_lifter(&program.info, thumb) {
         Some(l) => l,
         None => {
             eprintln!("Decompilation not yet supported for {}", program.info.arch);
@@ -726,7 +757,7 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
 fn cmd_taint(path: &Path, address: Option<u64>, params: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
-    let lifter = match create_lifter(program.info.arch, program.info.bits, program.info.endian, thumb) {
+    let lifter = match make_lifter(&program.info, thumb) {
         Some(l) => l,
         None => {
             eprintln!("Taint analysis not yet supported for {}", program.info.arch);
@@ -807,7 +838,7 @@ fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u
     let info = BinaryLoader::load(path)?;
 
     let is_64 = info.bits == 64;
-    let lifter = match create_lifter(info.arch, info.bits, info.endian, thumb) {
+    let lifter = match make_lifter(&info, thumb) {
         Some(l) => l,
         None => {
             eprintln!("Emulation not yet supported for {}", info.arch);
@@ -943,7 +974,7 @@ fn build_emulator_target(
     entry: u64,
     thumb: bool,
 ) -> Option<EmulatorTarget> {
-    let lifter = create_lifter(info.arch, info.bits, info.endian, thumb)?;
+    let lifter = make_lifter(&info, thumb)?;
     let is_64 = info.bits == 64;
     let mut emu = gr_emulator::Emulator::new();
     for block in info.memory.blocks() {
@@ -1516,7 +1547,7 @@ fn cmd_script(path: &Path, script_path: &Path, thumb: bool) -> Result<(), Box<dy
                 }
             }
             "decompile" => {
-                if let Some(lifter) = create_lifter(info.arch, info.bits, info.endian, thumb) {
+                if let Some(lifter) = make_lifter(&info, thumb) {
                     let addr = parse_hex(args).unwrap_or(info.entry_point);
                     match gr_decompile::decompile_function(lifter.as_ref(), &program, addr) {
                         Ok(result) => print!("{}", result.c_code),
