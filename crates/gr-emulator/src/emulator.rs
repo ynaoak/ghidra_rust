@@ -377,22 +377,41 @@ impl Emulator {
                 self.state.write_varnode(out, a.round() as i64 as u64);
             }
             OpCode::IntCarry => {
+                // Detect unsigned overflow at the operand size, not u64.
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_CARRY".into()))?;
-                let a = self.read_input(op, 0)?;
-                let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, if a.checked_add(b).is_none() { 1 } else { 0 });
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8);
+                let mask = if size >= 8 { u64::MAX } else { (1u64 << (size * 8)) - 1 };
+                let a = self.read_input(op, 0)? & mask;
+                let b = self.read_input(op, 1)? & mask;
+                let sum = a.wrapping_add(b) & mask;
+                self.state.write_varnode(out, if sum < a { 1 } else { 0 });
             }
             OpCode::IntSCarry => {
+                // Detect signed overflow at the operand size, not i64.
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SCARRY".into()))?;
-                let a = self.read_input(op, 0)? as i64;
-                let b = self.read_input(op, 1)? as i64;
-                self.state.write_varnode(out, if a.checked_add(b).is_none() { 1 } else { 0 });
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8);
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                let overflow = match size {
+                    1 => (a as i8).checked_add(b as i8).is_none(),
+                    2 => (a as i16).checked_add(b as i16).is_none(),
+                    4 => (a as i32).checked_add(b as i32).is_none(),
+                    _ => (a as i64).checked_add(b as i64).is_none(),
+                };
+                self.state.write_varnode(out, if overflow { 1 } else { 0 });
             }
             OpCode::IntSBorrow => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SBORROW".into()))?;
-                let a = self.read_input(op, 0)? as i64;
-                let b = self.read_input(op, 1)? as i64;
-                self.state.write_varnode(out, if a.checked_sub(b).is_none() { 1 } else { 0 });
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8);
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                let overflow = match size {
+                    1 => (a as i8).checked_sub(b as i8).is_none(),
+                    2 => (a as i16).checked_sub(b as i16).is_none(),
+                    4 => (a as i32).checked_sub(b as i32).is_none(),
+                    _ => (a as i64).checked_sub(b as i64).is_none(),
+                };
+                self.state.write_varnode(out, if overflow { 1 } else { 0 });
             }
             OpCode::IntLessEqual => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_LESSEQUAL".into()))?;
@@ -515,6 +534,51 @@ mod tests {
 
     fn seq() -> SeqNum {
         SeqNum::new(Address::new(SpaceId(1), 0x1000), 0)
+    }
+
+    #[test]
+    fn emu_int_carry_respects_operand_size() {
+        // 0xFFFFFFFF + 1 at 4-byte width should carry. Previously the
+        // emulator checked u64 overflow which never triggered, breaking
+        // every flag computation built on IntCarry for 32-bit ARM/SPARC.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFFFF_FFFF);
+        emu.state.write_register(0x04, 4, 1);
+        let op = PcodeOp {
+            opcode: OpCode::IntCarry,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 1)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x04, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 1), 1);
+
+        // 0x0FFFFFFF + 1 should NOT carry at 32-bit width.
+        emu.state.write_register(0x00, 4, 0x0FFF_FFFF);
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 1), 0);
+    }
+
+    #[test]
+    fn emu_int_scarry_respects_operand_size() {
+        // INT_MAX_32 + 1 overflows signed at 32-bit width.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0x7FFF_FFFF);
+        emu.state.write_register(0x04, 4, 1);
+        let op = PcodeOp {
+            opcode: OpCode::IntSCarry,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 1)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x04, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 1), 1);
     }
 
     #[test]
