@@ -107,24 +107,51 @@ impl Emulator {
             }
 
             OpCode::IntLeft => {
+                // P-code semantics: shift by amount >= operand bitwidth gives 0
+                // (Rust's wrapping_shl wraps mod 64, which would mis-shift for
+                // amounts >= bitwidth on operands smaller than 64 bits, and
+                // wraps for amounts >= 64 even on 64-bit operands).
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_LEFT".into()))?;
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8).min(8);
+                let bits = (size * 8) as u64;
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, a.wrapping_shl(b as u32));
+                let result = if b >= bits { 0 } else { a.wrapping_shl(b as u32) };
+                self.state.write_varnode(out, result);
             }
 
             OpCode::IntRight => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_RIGHT".into()))?;
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8).min(8);
+                let bits = (size * 8) as u64;
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, a.wrapping_shr(b as u32));
+                let result = if b >= bits { 0 } else { a.wrapping_shr(b as u32) };
+                self.state.write_varnode(out, result);
             }
 
             OpCode::IntSRight => {
+                // Arithmetic shift: shift by >= bitwidth replicates the sign bit
+                // (all-ones if negative at the operand width, otherwise 0).
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SRIGHT".into()))?;
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8).min(8);
+                let bits = (size * 8) as u64;
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, (a as i64).wrapping_shr(b as u32) as u64);
+                let result = if b >= bits {
+                    let sign_bit = (a >> (bits - 1)) & 1;
+                    if sign_bit == 1 {
+                        if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }
+                    } else {
+                        0
+                    }
+                } else {
+                    // Sign-extend a from `bits` to 64, then arithmetic shift.
+                    let extend = 64 - bits as u32;
+                    let signed_a = ((a << extend) as i64) >> extend;
+                    signed_a.wrapping_shr(b as u32) as u64
+                };
+                self.state.write_varnode(out, result);
             }
 
             OpCode::IntEqual => {
@@ -534,6 +561,97 @@ mod tests {
 
     fn seq() -> SeqNum {
         SeqNum::new(Address::new(SpaceId(1), 0x1000), 0)
+    }
+
+    #[test]
+    fn emu_int_left_zero_for_shift_at_or_above_width() {
+        // Per P-code spec, shift by amount >= operand bitwidth returns 0,
+        // not the wrap-around result Rust's wrapping_shl would produce.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0x0000_00FF);
+        // 4-byte operand shifted by 65: previously the emulator's u64 wrap
+        // gave (a << 1) instead of 0.
+        emu.state.write_register(0x08, 4, 65);
+        let op = PcodeOp {
+            opcode: OpCode::IntLeft,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 4)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x08, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0);
+        // Exact-width shift (32) should also be 0.
+        emu.state.write_register(0x08, 4, 32);
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0);
+        // In-range shift still works.
+        emu.state.write_register(0x08, 4, 4);
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0xFF0);
+    }
+
+    #[test]
+    fn emu_int_right_zero_for_shift_at_or_above_width() {
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFF00_0000);
+        emu.state.write_register(0x08, 4, 64);
+        let op = PcodeOp {
+            opcode: OpCode::IntRight,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 4)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x08, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0);
+    }
+
+    #[test]
+    fn emu_int_sright_replicates_sign_bit_above_width() {
+        // ASR by >= bitwidth replicates the sign bit at the operand width.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFFFF_FFFF); // -1 as i32
+        emu.state.write_register(0x08, 4, 40);
+        let op = PcodeOp {
+            opcode: OpCode::IntSRight,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 4)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x08, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0xFFFF_FFFF);
+        // Non-negative: result = 0.
+        emu.state.write_register(0x00, 4, 0x7000_0000);
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0);
+    }
+
+    #[test]
+    fn emu_int_sright_sign_extends_at_operand_width() {
+        // ASR of a 32-bit -2 by 1 must give 32-bit -1, not 0x7FFFFFFF
+        // (which would happen if the source were treated as u64 positive).
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFFFF_FFFE);
+        emu.state.write_register(0x08, 4, 1);
+        let op = PcodeOp {
+            opcode: OpCode::IntSRight,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 4)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x08, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0xFFFF_FFFF);
     }
 
     #[test]
