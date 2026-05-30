@@ -1432,15 +1432,22 @@ impl Arm32Lifter {
         }
 
         let size = if byte { 1 } else { 4 };
+        // `ldr pc, [...]` is an indirect branch; the loaded value still needs
+        // to flow through writeback before the transfer, so route the load
+        // through a temp and emit a BranchInd at the end.
+        let load_into_pc = load && !byte && rd == PC_INDEX;
+        let pc_target = if load_into_pc { Some(unique(0x612, 4)) } else { None };
         if load {
-            if rd == PC_INDEX {
-                return; // load into PC = control flow, skip
-            }
             if byte {
                 let loaded = unique(0x610, 1);
                 ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(*s), output: Some(loaded), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
                 *s += 1;
-                ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[loaded]) });
+                if rd != PC_INDEX {
+                    ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[loaded]) });
+                    *s += 1;
+                }
+            } else if let Some(t) = pc_target {
+                ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
                 *s += 1;
             } else {
                 ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
@@ -1461,6 +1468,11 @@ impl Arm32Lifter {
         if !pre || writeback {
             let off = if i_bit { reg(word & 0xF) } else { constant((word & 0xFFF) as u64, 4) };
             ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(reg(rn)), inputs: SmallVec::from_slice(&[reg(rn), off]) });
+            *s += 1;
+        }
+        // ldr pc, [...] -> indirect branch after the writeback has committed.
+        if let Some(t) = pc_target {
+            ops.push(PcodeOp { opcode: OpCode::BranchInd, seq: seq(*s), output: None, inputs: SmallVec::from_slice(&[t]) });
             *s += 1;
         }
         let _ = size;
@@ -1546,6 +1558,10 @@ impl Arm32Lifter {
             -(4 * count as i64) + if pre { 0 } else { 4 }
         };
 
+        // Pop {pc}: load the PC value into a temp, do the loop's other loads,
+        // do the writeback (so SP updates), THEN emit Return. Previously the
+        // Return was pushed mid-loop and any subsequent writeback was dead.
+        let mut pc_loaded: Option<VarnodeData> = None;
         for i in 0..16u32 {
             if reg_list & (1 << i) == 0 {
                 continue;
@@ -1559,12 +1575,10 @@ impl Arm32Lifter {
             *s += 1;
             if load {
                 if i == PC_INDEX {
-                    // pop pc => return
                     let loaded = unique(0x690 + *s as u64, 4);
                     ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(*s), output: Some(loaded), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), ea]) });
                     *s += 1;
-                    ops.push(PcodeOp { opcode: OpCode::Return, seq: seq(*s), output: None, inputs: SmallVec::from_slice(&[loaded]) });
-                    *s += 1;
+                    pc_loaded = Some(loaded);
                 } else {
                     ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(*s), output: Some(reg(i)), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), ea]) });
                     *s += 1;
@@ -1581,6 +1595,12 @@ impl Arm32Lifter {
             let delta = 4 * count as u64;
             let op = if up { OpCode::IntAdd } else { OpCode::IntSub };
             ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(base), inputs: SmallVec::from_slice(&[base, constant(delta, 4)]) });
+            *s += 1;
+        }
+        // Pop {pc} returns; emit the Return after the writeback so SP is
+        // updated before control transfers.
+        if let Some(loaded_pc) = pc_loaded {
+            ops.push(PcodeOp { opcode: OpCode::Return, seq: seq(*s), output: None, inputs: SmallVec::from_slice(&[loaded_pc]) });
             *s += 1;
         }
     }
@@ -2427,6 +2447,37 @@ mod tests {
         // base r1 should be written back (IntAdd into r1)
         assert!(ops.iter().any(|o| o.opcode == OpCode::IntAdd
             && o.output.map(|v| v.offset == 4).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_ldr_pc_branches_indirect() {
+        // ldr pc, [r1, #4]! (pre-index with writeback) = 0xE5B1F004
+        // Previously the lifter returned early on rd==PC, dropping both the
+        // load and the writeback. Should now: Load -> writeback r1 -> BranchInd.
+        let ops = lift(0xE5B1_F004);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Load));
+        // r1 written back
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntAdd
+            && o.output.map(|v| v.offset == 4).unwrap_or(false)));
+        // BranchInd is last
+        let last = ops.last().unwrap();
+        assert_eq!(last.opcode, OpCode::BranchInd);
+        assert_eq!(last.inputs[0].space, CoreSpace::UNIQUE);
+    }
+
+    #[test]
+    fn lift_pop_pc_emits_return_after_writeback() {
+        // pop {r0, pc} = ldmia sp!, {r0, pc} = 0xE8BD8001
+        // Previously the Return was emitted mid-loop and the writeback (sp += 8)
+        // never ran. Now writeback comes before the Return.
+        let ops = lift(0xE8BD_8001);
+        // Find IntAdd into sp (offset = 13*4 = 52)
+        let sp_writeback_idx = ops.iter().position(|o| o.opcode == OpCode::IntAdd
+            && o.output.map(|v| v.offset == 13 * 4).unwrap_or(false)).expect("expected sp writeback");
+        let return_idx = ops.iter().position(|o| o.opcode == OpCode::Return)
+            .expect("expected Return op");
+        assert!(sp_writeback_idx < return_idx,
+            "writeback (idx {}) must come before Return (idx {})", sp_writeback_idx, return_idx);
     }
 
     // ---- Thumb (T16/T32) ----
