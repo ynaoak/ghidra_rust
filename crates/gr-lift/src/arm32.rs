@@ -612,26 +612,30 @@ impl Arm32Lifter {
             let rn = hw1 & 0xF;
             let rt = (hw2 >> 12) & 0xF;
             let imm12 = hw2 & 0xFFF;
-            if !(load && rt == PC_INDEX) {
-                let addr = unique(0x600, 4);
-                ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(s), output: Some(addr), inputs: SmallVec::from_slice(&[reg(rn), constant(imm12 as u64, 4)]) });
-                s += 1;
-                if load {
-                    if size == 4 {
-                        ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(reg(rt)), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
-                    } else {
-                        let loaded = unique(0x610, size);
-                        ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(loaded), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
-                        s += 1;
-                        let ext = if signed { OpCode::IntSExt } else { OpCode::IntZExt };
-                        ops.push(PcodeOp { opcode: ext, seq: seq(s), output: Some(reg(rt)), inputs: SmallVec::from_slice(&[loaded]) });
-                    }
+            let addr = unique(0x600, 4);
+            ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(s), output: Some(addr), inputs: SmallVec::from_slice(&[reg(rn), constant(imm12 as u64, 4)]) });
+            s += 1;
+            if load {
+                if size == 4 && rt == PC_INDEX {
+                    // ldr.w pc, [...] -> indirect branch
+                    let t = unique(0x612, 4);
+                    ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(t), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
+                    s += 1;
+                    ops.push(PcodeOp { opcode: OpCode::BranchInd, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[t]) });
+                } else if size == 4 {
+                    ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(reg(rt)), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
                 } else {
-                    let value = if size == 4 { reg(rt) } else { VarnodeData::new(REG_SPACE, rt as u64 * 4, size) };
-                    ops.push(PcodeOp { opcode: OpCode::Store, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr, value]) });
+                    let loaded = unique(0x610, size);
+                    ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(loaded), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
+                    s += 1;
+                    let ext = if signed { OpCode::IntSExt } else { OpCode::IntZExt };
+                    ops.push(PcodeOp { opcode: ext, seq: seq(s), output: Some(reg(rt)), inputs: SmallVec::from_slice(&[loaded]) });
                 }
-                return ops;
+            } else {
+                let value = if size == 4 { reg(rt) } else { VarnodeData::new(REG_SPACE, rt as u64 * 4, size) };
+                ops.push(PcodeOp { opcode: OpCode::Store, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr, value]) });
             }
+            return ops;
         }
 
         ops
@@ -1052,7 +1056,15 @@ impl Arm32Lifter {
             0xB => self.emit_cmn_flags(rn_v, op2, ops, s, address),                     // CMN
             0xC => self.dp_binop(OpCode::IntOr, rd, rn_v, op2, ops, s, address),        // ORR
             0xD => { // MOV
-                if let Some(out) = self.rd_out(rd) {
+                if rd == PC_INDEX && cond == COND_AL {
+                    // mov pc, X = indirect branch; if X is exactly LR it's a
+                    // return. Conditional movXX pc, ... isn't modelled
+                    // (intra-instruction p-code branches unsupported).
+                    let is_lr = op2.space == REG_SPACE && op2.offset == LR_INDEX as u64 * 4 && op2.size == 4;
+                    let opc = if is_lr { OpCode::Return } else { OpCode::BranchInd };
+                    ops.push(PcodeOp { opcode: opc, seq: seq(*s), output: None, inputs: SmallVec::from_slice(&[op2]) });
+                    *s += 1;
+                } else if let Some(out) = self.rd_out(rd) {
                     ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(out), inputs: SmallVec::from_slice(&[op2]) });
                     *s += 1;
                 }
@@ -2461,6 +2473,33 @@ mod tests {
             && o.output.map(|v| v.offset == 4).unwrap_or(false)));
         // BranchInd is last
         let last = ops.last().unwrap();
+        assert_eq!(last.opcode, OpCode::BranchInd);
+        assert_eq!(last.inputs[0].space, CoreSpace::UNIQUE);
+    }
+
+    #[test]
+    fn lift_mov_pc_lr_is_return() {
+        // mov pc, lr => 0xE1A0F00E (the classic ARM return idiom)
+        let ops = lift(0xE1A0_F00E);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opcode, OpCode::Return);
+    }
+
+    #[test]
+    fn lift_mov_pc_reg_is_branch_ind() {
+        // mov pc, r3 => 0xE1A0F003 (computed/indirect branch to r3)
+        let ops = lift(0xE1A0_F003);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opcode, OpCode::BranchInd);
+        assert_eq!(ops[0].inputs[0].offset, 12); // r3
+    }
+
+    #[test]
+    fn lift_thumb_ldr_w_pc_branches_indirect() {
+        // ldr.w pc, [r1, #4] = [0xF8D1, 0xF004]
+        let li = lift_thumb(&[0xF8D1, 0xF004]);
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::Load));
+        let last = li.ops.last().unwrap();
         assert_eq!(last.opcode, OpCode::BranchInd);
         assert_eq!(last.inputs[0].space, CoreSpace::UNIQUE);
     }
