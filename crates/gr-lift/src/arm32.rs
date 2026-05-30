@@ -12,8 +12,11 @@
 //! support intra-instruction p-code branches. Thumb IT blocks are handled via a
 //! `LiftContext` threaded through a contiguous lift: the IT instruction arms the
 //! state and each guarded instruction is predicated branch-free (register writes
-//! committed by select, a guarded unconditional branch becomes conditional).
-//! Guarded stores and conditional compares are not predicated (documented).
+//! committed by select, guarded stores committed via load-select-store, a
+//! guarded unconditional branch becomes conditional). T16 shift-by-register
+//! (lsls/lsrs/asrs/rors Rd, Rs) masks Rs to the low byte, applies the correct
+//! shift (including rotate for ROR), and sets NZC. Conditional compares are
+//! left unpredicated (documented edge case).
 
 use gr_core::address::{Address, Endian, SpaceId};
 use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
@@ -204,12 +207,31 @@ impl Arm32Lifter {
             let rd = h & 7;
             let rm = (h >> 3) & 7;
             let op4 = (h >> 6) & 0xF;
+            // Shift-by-register (LSL/LSR/ASR/ROR): mask Rs to the low byte,
+            // apply the shift, and set NZC (V unchanged) — T16 ALU ops always
+            // set flags.
+            if matches!(op4, 0x2 | 0x3 | 0x4 | 0x7) {
+                let shift_type = match op4 {
+                    0x2 => 0,
+                    0x3 => 1,
+                    0x4 => 2,
+                    _ => 3,
+                };
+                let amt = unique(0x754, 4);
+                ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(*s), output: Some(amt), inputs: SmallVec::from_slice(&[reg(rm), constant(0xFF, 4)]) });
+                *s += 1;
+                let carry = self.emit_reg_shift_carry(shift_type, rd, amt, ops, s, address);
+                let result = self.emit_reg_shift_value(shift_type, rd, amt, ops, s, address);
+                ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[result]) });
+                *s += 1;
+                self.set_nz(reg(rd), ops, s, address);
+                ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(flag(C_FLAG)), inputs: SmallVec::from_slice(&[carry]) });
+                *s += 1;
+                return;
+            }
             match op4 {
                 0x0 => ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
                 0x1 => ops.push(PcodeOp { opcode: OpCode::IntXor, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
-                0x2 => ops.push(PcodeOp { opcode: OpCode::IntLeft, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
-                0x3 => ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
-                0x4 => ops.push(PcodeOp { opcode: OpCode::IntSRight, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
                 0x8 => { self.emit_cmp_flags(true, reg(rd), reg(rm), ops, s, address); return; }   // TST
                 0xA => { self.emit_cmp_flags(false, reg(rd), reg(rm), ops, s, address); return; }  // CMP
                 0xB => { self.emit_cmn_flags(reg(rd), reg(rm), ops, s, address); return; }         // CMN
@@ -750,6 +772,27 @@ impl Arm32Lifter {
                 let a = unique(0x7BC, 4);
                 push(ops, s, OpCode::IntAnd, a, &[x, constant(31, 4)]);
                 a
+            }
+            2 => {
+                // ASR: amt > 32 must yield C = Rm[31], so clamp the bit index
+                // to 31. (LSR/LSL >32 yield C = 0 via P-code shift semantics.)
+                let raw = unique(0x7B8, 4);
+                push(ops, s, OpCode::IntSub, raw, &[amt, constant(1, 4)]);
+                let big = unique(0x7E0, 1);
+                push(ops, s, OpCode::IntLess, big, &[constant(32, 4), amt]);
+                let bz = unique(0x7E4, 4);
+                push(ops, s, OpCode::IntZExt, bz, &[big]);
+                let bmask = unique(0x7E8, 4);
+                push(ops, s, OpCode::Int2Comp, bmask, &[bz]);
+                let hi = unique(0x7EC, 4);
+                push(ops, s, OpCode::IntAnd, hi, &[constant(31, 4), bmask]);
+                let nbmask = unique(0x7F0, 4);
+                push(ops, s, OpCode::IntNegate, nbmask, &[bmask]);
+                let lo = unique(0x7F4, 4);
+                push(ops, s, OpCode::IntAnd, lo, &[raw, nbmask]);
+                let idx = unique(0x7F8, 4);
+                push(ops, s, OpCode::IntOr, idx, &[hi, lo]);
+                idx
             }
             _ => {
                 let t = unique(0x7B8, 4);
@@ -1421,10 +1464,13 @@ impl Arm32Lifter {
 
         let mut out: Vec<PcodeOp> = Vec::new();
         let mut s = 0u32;
-        // Save the old value of each register that will be written.
+        // Save the old value of each register that will be written. Offsets
+        // start at 0x900 to stay above the lift_data_processing scratch range
+        // used by emit_reg_shift_carry (0x7B0-0x7F8), so a predicated T16
+        // register-shifted instruction doesn't clobber its own saves.
         let mut olds = Vec::new();
         for (i, r) in regs.iter().enumerate() {
-            let o = unique(0x7C0 + i as u64 * 8, r.size);
+            let o = unique(0x900 + i as u64 * 8, r.size);
             out.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(o), inputs: SmallVec::from_slice(&[*r]) });
             s += 1;
             olds.push(o);
@@ -1433,7 +1479,7 @@ impl Arm32Lifter {
         // the store guard nor the final selects see post-op flag updates if the
         // predicated instruction itself modifies NZCV.
         let c_raw = self.emit_cond(cond, &mut out, &mut s, address);
-        let c = unique(0x7B0, 1);
+        let c = unique(0x8F8, 1);
         out.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(c), inputs: SmallVec::from_slice(&[c_raw]) });
         s += 1;
         // Original ops, with each Store transformed into a guarded
@@ -1893,6 +1939,20 @@ mod tests {
     }
 
     #[test]
+    fn lift_movs_asr_reg_clamps_carry_index() {
+        // movs r0, r1, asr r2 => 0xE1B00251 (S=1, ASR by register, logical)
+        let ops = lift(0xE1B0_0251);
+        // The ASR carry path compares amt against 32 to clamp the index, so
+        // an IntLess comparing constant 32 against the amount appears.
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntLess
+            && o.inputs[0].space == CoreSpace::CONST
+            && o.inputs[0].offset == 32));
+        // Final C flag still written.
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
     fn lift_mov_reg_shift_ror_expands() {
         // mov r0, r1, ror r2 => 0xE1A00271
         let ops = lift(0xE1A0_0271);
@@ -1917,6 +1977,35 @@ mod tests {
             && o.inputs[0].offset == 4 // r1
             && o.inputs[1].space == CoreSpace::CONST && o.inputs[1].offset == 1));
         assert!(ops.iter().any(|o| o.opcode == OpCode::IntOr));
+    }
+
+    #[test]
+    fn thumb_lsls_by_register_sets_flags() {
+        // lsls r0, r1 (T16 format-4 ALU op=2, rm=1, rd=0) = 0x4088
+        let li = lift_thumb(&[0x4088]);
+        // Rs masked to low byte
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntAnd
+            && o.inputs[0].offset == 4 // r1
+            && o.inputs[1].space == CoreSpace::CONST && o.inputs[1].offset == 0xFF));
+        // Shift applied
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntLeft));
+        // N/Z/C set
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == N_FLAG).unwrap_or(false)));
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn thumb_rors_by_register_uses_rotate() {
+        // rors r0, r1 (T16 format-4 ALU op=7) = 0x41C8
+        let li = lift_thumb(&[0x41C8]);
+        // ROR expands to (>>amt) | (<<(32-amt))
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntRight));
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntSub
+            && o.inputs[0].space == CoreSpace::CONST && o.inputs[0].offset == 32));
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntLeft));
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntOr));
     }
 
     #[test]
