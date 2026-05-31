@@ -99,10 +99,18 @@ pub fn constant_fold(func: &mut SsaFunction) -> usize {
         if let Some(val) = result {
             let out_id = func.ops[i].output.unwrap();
             let out_size = func.varnodes[out_id as usize].data.size;
+            // Truncate to the operand width: a folded 32-bit `0xFFFFFFFF + 1`
+            // must be 0, not 0x1_0000_0000. The constant is emitted from its
+            // raw offset, so an unmasked value would print (and re-fold) wrong.
+            let masked = if out_size >= 8 {
+                val
+            } else {
+                val & ((1u64 << (out_size * 8)) - 1)
+            };
             let const_id = func.varnodes.len() as u32;
             func.varnodes.push(crate::ssa::SsaVarnode {
                 id: const_id,
-                data: gr_core::pcode::VarnodeData::new(gr_core::address::SpaceId::CONST, val, out_size),
+                data: gr_core::pcode::VarnodeData::new(gr_core::address::SpaceId::CONST, masked, out_size),
                 version: 0,
                 def_op: None,
                 uses: vec![i],
@@ -542,6 +550,41 @@ mod tests {
         let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
         let folded = constant_fold(&mut ssa);
         assert!(folded > 0);
+    }
+
+    #[test]
+    fn constant_folding_truncates_to_operand_width() {
+        // 32-bit 0xFFFFFFFF + 1 must fold to 0, not 0x1_0000_0000.
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let reg = VarnodeData::new(SpaceId(2), 0x00, 4); // 4-byte result
+        let a = VarnodeData::new(SpaceId(0), 0xFFFF_FFFF, 4);
+        let b = VarnodeData::new(SpaceId(0), 1, 4);
+
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::IntAdd,
+                seq: seq(0x1000),
+                output: Some(reg),
+                inputs: SmallVec::from_slice(&[a, b]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1001),
+                output: None,
+                inputs: SmallVec::from_slice(&[reg]),
+            }]),
+        ];
+
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        assert!(constant_fold(&mut ssa) > 0);
+        // The folded op is now a Copy of a CONST whose value is masked to 4 bytes.
+        let folded_const = ssa.ops.iter()
+            .find(|o| o.opcode == OpCode::Copy && !o.dead)
+            .and_then(|o| o.inputs.first().copied())
+            .map(|id| ssa.varnodes[id as usize].data.offset)
+            .expect("expected a folded Copy of a constant");
+        assert_eq!(folded_const, 0, "0xFFFFFFFF + 1 at 4 bytes must wrap to 0");
     }
 
     #[test]
