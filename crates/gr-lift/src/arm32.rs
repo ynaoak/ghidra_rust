@@ -1342,8 +1342,13 @@ impl Arm32Lifter {
         let c = flag(C_FLAG);
         let v = flag(V_FLAG);
 
+        // A fixed scratch slot: at most one `not` result is live per emit_cond
+        // call, and it never overlaps the condition's own 0x760/0x768 temps.
+        // (The previous `0x740 + 2*s` scheme grew unboundedly with the op count
+        // and could land on fixed caller slots like cond_old at 0x778 for
+        // register-shifted, flag-setting, conditional data-processing.)
         let not = |ops: &mut Vec<PcodeOp>, s: &mut u32, x: VarnodeData| -> VarnodeData {
-            let t = unique(0x740 + *s as u64 * 2, 1);
+            let t = unique(0x76C, 1);
             ops.push(PcodeOp { opcode: OpCode::BoolNegate, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[x]) });
             *s += 1;
             t
@@ -1483,7 +1488,16 @@ impl Arm32Lifter {
             *s += 1;
         }
         // ldr pc, [...] -> indirect branch after the writeback has committed.
-        if let Some(t) = pc_target {
+        // Only an unconditional `ldr pc` becomes a transfer: a conditional
+        // `ldrXX pc` (e.g. the `ldrls pc, [pc, rN, lsl #2]` jump-table idiom)
+        // would otherwise be emitted as an *unconditional* BranchInd, dropping
+        // its fall-through path. Conditional control transfers can't be modelled
+        // here (no intra-instruction predicated branch), so the loaded PC is
+        // left dead and the load/writeback side effects are preserved.
+        let cond = word >> 28;
+        if let Some(t) = pc_target
+            && cond == COND_AL
+        {
             ops.push(PcodeOp { opcode: OpCode::BranchInd, seq: seq(*s), output: None, inputs: SmallVec::from_slice(&[t]) });
             *s += 1;
         }
@@ -2452,6 +2466,32 @@ mod tests {
     }
 
     #[test]
+    fn emit_cond_scratch_does_not_clobber_saved_rd() {
+        // andnes r0, r1, r2, asr r3 => conditional (NE), S-bit, logical,
+        // register-shifted: the longest operand2 + cond-save path. The NE
+        // condition's BoolNegate scratch must not land on the saved-old-Rd
+        // slot (0x778) regardless of how many ops precede it. Verify the
+        // saved Rd Copy at 0x778 is never overwritten by a later BoolNegate.
+        // andnes r0,r1,r2,asr r3: cond=NE(1), I=0, opcode=BIC(0xE)? no — AND=0x0
+        // ands with reg-shift asr-by-reg: 0x10110052 | shift... build it:
+        // cond=1, 00, I=0, AND=0000, S=1, Rn=1, Rd=0, Rs=3, 0,asr=10,1,Rm=2
+        // = 0001 000 0000 1 0001 0000 0011 0 10 1 0010 = 0x10110352
+        let ops = lift(0x1011_0352);
+        // The 0x778 save (Copy of old r0 into unique 0x778) must be present and
+        // never overwritten by a BoolNegate (the emit_cond scratch).
+        let saves_778 = ops.iter().filter(|o|
+            o.output.map(|v| v.space == CoreSpace::UNIQUE && v.offset == 0x778).unwrap_or(false));
+        for o in saves_778 {
+            assert_eq!(o.opcode, OpCode::Copy,
+                "0x778 (saved Rd) must only be written by the save Copy, not clobbered by emit_cond scratch");
+        }
+        // The BoolNegate (NE = !Z) writes the fixed 0x76C slot, not 0x778.
+        if let Some(bn) = ops.iter().find(|o| o.opcode == OpCode::BoolNegate) {
+            assert_ne!(bn.output.unwrap().offset, 0x778);
+        }
+    }
+
+    #[test]
     fn lift_ldr_post_index_writeback() {
         // ldr r0, [r1], #4 => post-indexed: 0xE4910004
         let ops = lift(0xE491_0004);
@@ -2475,6 +2515,17 @@ mod tests {
         let last = ops.last().unwrap();
         assert_eq!(last.opcode, OpCode::BranchInd);
         assert_eq!(last.inputs[0].space, CoreSpace::UNIQUE);
+    }
+
+    #[test]
+    fn lift_conditional_ldr_pc_no_unconditional_branch() {
+        // ldrls pc, [r1, #4] (cond=LS=9) = 0x95B1F004 — a conditional load to
+        // PC must NOT become an unconditional BranchInd (that would drop the
+        // fall-through). The load/writeback side effects are kept; no transfer.
+        let ops = lift(0x95B1_F004);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Load));
+        assert!(!ops.iter().any(|o| o.opcode == OpCode::BranchInd),
+            "conditional ldr pc must not emit an unconditional indirect branch");
     }
 
     #[test]

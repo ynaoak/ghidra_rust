@@ -40,7 +40,17 @@ impl BasicBlock {
         self.instructions.last().and_then(|i| {
             i.ops.iter().rev().find_map(|op| {
                 if matches!(op.opcode, OpCode::Branch | OpCode::CBranch | OpCode::Call) {
-                    op.inputs.first().map(|vn| vn.offset)
+                    // Only a RAM-space operand is a real code address; the
+                    // leader pass applies the same guard, so successor wiring
+                    // must too, or a constant/register operand whose offset
+                    // happens to equal a block start would create a bogus edge.
+                    op.inputs.first().and_then(|vn| {
+                        if vn.space == gr_core::address::SpaceId::RAM {
+                            Some(vn.offset)
+                        } else {
+                            None
+                        }
+                    })
                 } else {
                     None
                 }
